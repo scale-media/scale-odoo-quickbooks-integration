@@ -1,0 +1,18 @@
+# Odoo → QuickBooks Integration - Terraform Variables
+# Copy this file to terraform.tfvars and fill in values
+
+aws_region  = "us-west-2"
+environment = "prod"
+
+# Odoo Configuration
+odoo_api_url = "https://scalemedia.odoo.com"
+
+# Alert recipient for pipeline failures
+alert_email = "data-engineering@scalemedia.com"
+
+# Schedule: how often to poll Odoo for new bills
+# Options: "rate(5 minutes)", "rate(15 minutes)", "rate(1 hour)"
+schedule_rate = "rate(15 minutes)"
+
+# Optional: Slack webhook for alerts (leave empty to disable)
+slack_webhook_url = ""
