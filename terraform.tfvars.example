@@ -1,18 +1,47 @@
-# Odoo → QuickBooks Integration - Terraform Variables
-# Copy this file to terraform.tfvars and fill in values
+# Odoo → QuickBooks Integration with Approval Flow
+# Copy to terraform.tfvars and fill in values
 
+# AWS Configuration
 aws_region  = "us-west-2"
 environment = "prod"
 
-# Odoo Configuration
-odoo_api_url = "https://scalemedia.odoo.com"
-
-# Alert recipient for pipeline failures
+# Alert email for pipeline failures
 alert_email = "data-engineering@scalemedia.com"
 
-# Schedule: how often to poll Odoo for new bills
-# Options: "rate(5 minutes)", "rate(15 minutes)", "rate(1 hour)"
+# EventBridge schedule (how often to poll Odoo)
 schedule_rate = "rate(15 minutes)"
 
-# Optional: Slack webhook for alerts (leave empty to disable)
-slack_webhook_url = ""
+# Odoo Configuration
+odoo_api_url  = "https://scalemedia.odoo.com"
+odoo_database = "odoo_database"
+odoo_username = "odoo_username"
+odoo_api_key  = "odoo_api_key_here"
+
+# QuickBooks Configuration
+# Get from Intuit Developer Portal: https://developer.intuit.com/
+qb_client_id     = "your_qb_client_id"
+qb_client_secret = "your_qb_client_secret"
+qb_refresh_token = "your_qb_refresh_token"
+
+# Set to true for testing with QB sandbox
+qb_use_sandbox = false
+
+# Realm IDs for each company (get from QB OAuth flow)
+# Leave empty for companies not yet configured
+qb_realm_ids = {
+  "1MD"               = ""
+  "LiveConscious"     = ""
+  "EssentialElements" = ""
+  "TruAlchemy"        = ""
+}
+
+# Slack Configuration
+# Channel ID: right-click channel → Copy link → ID is at end of URL
+slack_channel_id = ""
+
+# From: Slack App → OAuth & Permissions → Bot User OAuth Token
+slack_bot_token = "xoxb-your-bot-token-here"
+
+# From: Slack App → Basic Information → Signing Secret
+slack_signing_secret = "your_signing_secret_here"
+

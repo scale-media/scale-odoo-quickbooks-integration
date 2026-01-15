@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Build Lambda deployment packages for Odoo-QB integration
+# Build Lambda deployment packages for Odoo-QB integration with approval flow
 #
 
 set -e
@@ -9,46 +9,46 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAMBDA_DIR="$SCRIPT_DIR/lambda"
 BUILD_DIR="$SCRIPT_DIR/build"
 
-echo "🔨 Building Lambda deployment packages..."
+echo "Building Lambda deployment packages..."
 
 # Clean up
 rm -rf "$BUILD_DIR"
-rm -f "$LAMBDA_DIR/odoo_extractor.zip"
-rm -f "$LAMBDA_DIR/qb_poster.zip"
+rm -f "$LAMBDA_DIR"/*.zip
 
 # Create build directory
 mkdir -p "$BUILD_DIR/deps"
 
-# Install dependencies (shared between both functions)
-echo "📦 Installing dependencies..."
+# Install dependencies
+echo "Installing dependencies..."
 pip install -r "$LAMBDA_DIR/requirements.txt" -t "$BUILD_DIR/deps" --quiet --upgrade
 
-# Build odoo_extractor.zip
-echo "📋 Building odoo_extractor.zip..."
-cd "$BUILD_DIR"
-rm -rf extractor && mkdir extractor
-cp -r deps/* extractor/
-cp "$LAMBDA_DIR/odoo_extractor.py" extractor/
-cd extractor
-zip -r "$LAMBDA_DIR/odoo_extractor.zip" . -q
-EXTRACTOR_SIZE=$(du -h "$LAMBDA_DIR/odoo_extractor.zip" | cut -f1)
-echo "   ✅ odoo_extractor.zip ($EXTRACTOR_SIZE)"
+# Function to build a Lambda package
+build_lambda() {
+    local name=$1
+    local source=$2
+    
+    echo "Building ${name}.zip..."
+    cd "$BUILD_DIR"
+    rm -rf "$name" && mkdir "$name"
+    cp -r deps/* "$name/"
+    cp "$LAMBDA_DIR/$source" "$name/"
+    cd "$name"
+    zip -r "$LAMBDA_DIR/${name}.zip" . -q
+    local size=$(du -h "$LAMBDA_DIR/${name}.zip" | cut -f1)
+    echo "${name}.zip ($size)"
+}
 
-# Build qb_poster.zip
-echo "📋 Building qb_poster.zip..."
-cd "$BUILD_DIR"
-rm -rf poster && mkdir poster
-cp -r deps/* poster/
-cp "$LAMBDA_DIR/qb_poster.py" poster/
-cd poster
-zip -r "$LAMBDA_DIR/qb_poster.zip" . -q
-POSTER_SIZE=$(du -h "$LAMBDA_DIR/qb_poster.zip" | cut -f1)
-echo "   ✅ qb_poster.zip ($POSTER_SIZE)"
+# Build all Lambdas
+build_lambda "extractor" "extractor.py"
+build_lambda "notifier" "notifier.py"
+build_lambda "approval_handler" "approval_handler.py"
+build_lambda "poster" "poster.py"
 
 # Cleanup
 rm -rf "$BUILD_DIR"
 
 echo ""
-echo "✅ Build complete!"
-echo "   - lambda/odoo_extractor.zip ($EXTRACTOR_SIZE)"
-echo "   - lambda/qb_poster.zip ($POSTER_SIZE)"
+echo "Build complete!"
+echo ""
+echo "Packages created:"
+ls -lh "$LAMBDA_DIR"/*.zip

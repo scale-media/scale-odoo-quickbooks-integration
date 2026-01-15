@@ -7,13 +7,6 @@ terraform {
       version = "~> 5.0"
     }
   }
-  
-  # Uncomment for remote state
-  # backend "s3" {
-  #   bucket = "scale-media-terraform-state"
-  #   key    = "odoo-qb-integration/terraform.tfstate"
-  #   region = "us-west-2"
-  # }
 }
 
 provider "aws" {
@@ -24,7 +17,6 @@ provider "aws" {
       Project     = "odoo-qb-integration"
       Environment = var.environment
       ManagedBy   = "terraform"
-      Team        = "data-engineering"
     }
   }
 }
@@ -60,11 +52,74 @@ variable "schedule_rate" {
   default     = "rate(15 minutes)"
 }
 
-variable "slack_webhook_url" {
-  description = "Slack webhook URL for alerts (optional)"
+variable "slack_channel_id" {
+  description = "Slack channel ID for approval notifications"
   type        = string
-  default     = ""
+}
+
+variable "slack_bot_token" {
+  description = "Slack Bot OAuth token (starts with xoxb-)"
+  type        = string
   sensitive   = true
+}
+
+variable "slack_signing_secret" {
+  description = "Slack app signing secret for request verification"
+  type        = string
+  sensitive   = true
+}
+
+# Odoo Credentials
+variable "odoo_database" {
+  description = "Odoo database name"
+  type        = string
+  default     = "2jaszgithub-scale-media-master-305444"
+}
+
+variable "odoo_username" {
+  description = "Odoo API username (email)"
+  type        = string
+}
+
+variable "odoo_api_key" {
+  description = "Odoo API key"
+  type        = string
+  sensitive   = true
+}
+
+# QuickBooks Credentials
+variable "qb_client_id" {
+  description = "QuickBooks OAuth client ID"
+  type        = string
+}
+
+variable "qb_client_secret" {
+  description = "QuickBooks OAuth client secret"
+  type        = string
+  sensitive   = true
+}
+
+variable "qb_refresh_token" {
+  description = "QuickBooks OAuth refresh token"
+  type        = string
+  sensitive   = true
+}
+
+variable "qb_realm_ids" {
+  description = "QuickBooks realm IDs per company"
+  type        = map(string)
+  default     = {
+    "1MD"              = ""
+    "LiveConscious"    = ""
+    "EssentialElements" = ""
+    "TruAlchemy"       = ""
+  }
+}
+
+variable "qb_use_sandbox" {
+  description = "Use QuickBooks sandbox environment"
+  type        = bool
+  default     = false
 }
 
 # Data Sources
@@ -72,16 +127,10 @@ variable "slack_webhook_url" {
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
-##############################################################################
 # S3 Bucket - PDF Storage
-##############################################################################
 
 resource "aws_s3_bucket" "invoice_pdfs" {
   bucket = "scale-media-odoo-invoices-${var.environment}"
-  
-  tags = {
-    Name = "Odoo Invoice PDFs"
-  }
 }
 
 resource "aws_s3_bucket_versioning" "invoice_pdfs" {
@@ -104,7 +153,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "invoice_pdfs" {
     }
     
     expiration {
-      days = 2555  # 7 years for accounting records
+      days = 2555  # 7 years
     }
   }
 }
@@ -128,28 +177,14 @@ resource "aws_s3_bucket_public_access_block" "invoice_pdfs" {
   restrict_public_buckets = true
 }
 
-# S3 Event Notification to trigger Lambda 2
-resource "aws_s3_bucket_notification" "invoice_uploaded" {
-  bucket = aws_s3_bucket.invoice_pdfs.id
-  
-  lambda_function {
-    lambda_function_arn = aws_lambda_function.qb_poster.arn
-    events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = "pending/"
-    filter_suffix       = ".pdf"
-  }
-  
-  depends_on = [aws_lambda_permission.s3_invoke_qb_poster]
-}
-
-##############################################################################
-# DynamoDB - Invoice Metadata & Tracking
-##############################################################################
+# DynamoDB - Invoice Tracking with Streams
 
 resource "aws_dynamodb_table" "invoices" {
-  name           = "odoo-qb-invoices-${var.environment}"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "entry_id"
+  name             = "odoo-qb-invoices-${var.environment}"
+  billing_mode     = "PAY_PER_REQUEST"
+  hash_key         = "entry_id"
+  stream_enabled   = true
+  stream_view_type = "NEW_AND_OLD_IMAGES"
   
   attribute {
     name = "entry_id"
@@ -187,40 +222,36 @@ resource "aws_dynamodb_table" "invoices" {
   point_in_time_recovery {
     enabled = true
   }
-  
-  tags = {
-    Name = "Odoo QB Invoice Tracking"
-  }
 }
 
-# SQS - Dead Letter Queues
+# SQS - Approved Invoices Queue
 
-resource "aws_sqs_queue" "extractor_dlq" {
-  name                      = "odoo-extractor-dlq-${var.environment}"
-  message_retention_seconds = 1209600 
+resource "aws_sqs_queue" "approved_invoices" {
+  name                       = "odoo-approved-invoices-${var.environment}"
+  visibility_timeout_seconds = 300  # 5 min (match Lambda timeout)
+  message_retention_seconds  = 1209600  # 14 days
+  receive_wait_time_seconds  = 20  # Long polling
   
-  tags = {
-    Name = "Odoo Extractor DLQ"
-  }
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.poster_dlq.arn
+    maxReceiveCount     = 3
+  })
 }
 
 resource "aws_sqs_queue" "poster_dlq" {
-  name                      = "qb-poster-dlq-${var.environment}"
-  message_retention_seconds = 1209600 
-  
-  tags = {
-    Name = "QB Poster DLQ"
-  }
+  name                      = "odoo-poster-dlq-${var.environment}"
+  message_retention_seconds = 1209600
+}
+
+resource "aws_sqs_queue" "extractor_dlq" {
+  name                      = "odoo-extractor-dlq-${var.environment}"
+  message_retention_seconds = 1209600
 }
 
 # SNS - Alerting
 
 resource "aws_sns_topic" "alerts" {
   name = "odoo-qb-alerts-${var.environment}"
-  
-  tags = {
-    Name = "Odoo QB Alerts"
-  }
 }
 
 resource "aws_sns_topic_subscription" "email_alert" {
@@ -229,37 +260,55 @@ resource "aws_sns_topic_subscription" "email_alert" {
   endpoint  = var.alert_email
 }
 
-##############################################################################
-# Secrets Manager - Credentials
-##############################################################################
+# Secrets Manager
 
 resource "aws_secretsmanager_secret" "odoo_credentials" {
   name        = "odoo-qb-integration/odoo-credentials-${var.environment}"
   description = "Odoo API credentials"
-  
-  tags = {
-    Name = "Odoo API Credentials"
-  }
+}
+
+resource "aws_secretsmanager_secret_version" "odoo_credentials" {
+  secret_id = aws_secretsmanager_secret.odoo_credentials.id
+  secret_string = jsonencode({
+    database = var.odoo_database
+    username = var.odoo_username
+    api_key  = var.odoo_api_key
+  })
 }
 
 resource "aws_secretsmanager_secret" "qb_credentials" {
   name        = "odoo-qb-integration/quickbooks-credentials-${var.environment}"
   description = "QuickBooks OAuth credentials"
-  
-  tags = {
-    Name = "QuickBooks OAuth Credentials"
-  }
 }
 
-# Note: Secret values should be set manually or via separate secure process
-# Odoo format: {"database": "...", "username": "...", "password": "..."}
-# QB format: {"client_id": "...", "client_secret": "...", "refresh_token": "...", "realm_ids": {...}}
+resource "aws_secretsmanager_secret_version" "qb_credentials" {
+  secret_id = aws_secretsmanager_secret.qb_credentials.id
+  secret_string = jsonencode({
+    client_id      = var.qb_client_id
+    client_secret  = var.qb_client_secret
+    refresh_token  = var.qb_refresh_token
+    realm_ids      = var.qb_realm_ids
+    use_sandbox    = var.qb_use_sandbox
+  })
+}
 
-##############################################################################
-# IAM - Lambda Execution Roles
-##############################################################################
+resource "aws_secretsmanager_secret" "slack_config" {
+  name        = "odoo-qb-integration/slack-config-${var.environment}"
+  description = "Slack bot token and signing secret"
+}
 
-# Odoo Extractor Role
+resource "aws_secretsmanager_secret_version" "slack_config" {
+  secret_id = aws_secretsmanager_secret.slack_config.id
+  secret_string = jsonencode({
+    bot_token      = var.slack_bot_token
+    signing_secret = var.slack_signing_secret
+    channel_id     = var.slack_channel_id
+  })
+}
+
+# IAM Roles
+
+# Extractor Role
 resource "aws_iam_role" "extractor_role" {
   name = "odoo-extractor-role-${var.environment}"
   
@@ -268,240 +317,329 @@ resource "aws_iam_role" "extractor_role" {
     Statement = [{
       Action = "sts:AssumeRole"
       Effect = "Allow"
-      Principal = {
-        Service = "lambda.amazonaws.com"
-      }
+      Principal = { Service = "lambda.amazonaws.com" }
     }]
   })
 }
 
 resource "aws_iam_role_policy" "extractor_policy" {
-  name = "odoo-extractor-policy"
+  name = "extractor-policy"
   role = aws_iam_role.extractor_role.id
   
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "CloudWatchLogs"
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ]
-        Resource = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:*"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:aws:logs:*:*:*"
       },
       {
-        Sid    = "S3Write"
-        Effect = "Allow"
-        Action = [
-          "s3:PutObject",
-          "s3:GetObject"
-        ]
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:GetObject"]
         Resource = "${aws_s3_bucket.invoice_pdfs.arn}/*"
       },
       {
-        Sid    = "DynamoDB"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:UpdateItem",
-          "dynamodb:Query",
-          "dynamodb:Scan"
-        ]
-        Resource = [
-          aws_dynamodb_table.invoices.arn,
-          "${aws_dynamodb_table.invoices.arn}/index/*"
-        ]
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+        Resource = [aws_dynamodb_table.invoices.arn, "${aws_dynamodb_table.invoices.arn}/index/*"]
       },
       {
-        Sid    = "SecretsManager"
-        Effect = "Allow"
-        Action = ["secretsmanager:GetSecretValue"]
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
         Resource = aws_secretsmanager_secret.odoo_credentials.arn
       },
       {
-        Sid    = "SNS"
-        Effect = "Allow"
-        Action = ["sns:Publish"]
+        Effect   = "Allow"
+        Action   = ["sns:Publish"]
         Resource = aws_sns_topic.alerts.arn
       },
       {
-        Sid    = "SQS"
-        Effect = "Allow"
-        Action = ["sqs:SendMessage"]
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
         Resource = aws_sqs_queue.extractor_dlq.arn
       }
     ]
   })
 }
 
-# QB Poster Role
-resource "aws_iam_role" "poster_role" {
-  name = "qb-poster-role-${var.environment}"
+# Notifier Role
+resource "aws_iam_role" "notifier_role" {
+  name = "odoo-notifier-role-${var.environment}"
   
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
       Action = "sts:AssumeRole"
       Effect = "Allow"
-      Principal = {
-        Service = "lambda.amazonaws.com"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "notifier_policy" {
+  name = "notifier-policy"
+  role = aws_iam_role.notifier_role.id
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetRecords", "dynamodb:GetShardIterator", "dynamodb:DescribeStream", "dynamodb:ListStreams"]
+        Resource = aws_dynamodb_table.invoices.stream_arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.invoices.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "${aws_s3_bucket.invoice_pdfs.arn}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = aws_secretsmanager_secret.slack_config.arn
       }
+    ]
+  })
+}
+
+# Approval Handler Role
+resource "aws_iam_role" "approval_role" {
+  name = "odoo-approval-role-${var.environment}"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "approval_policy" {
+  name = "approval-policy"
+  role = aws_iam_role.approval_role.id
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
+        Resource = aws_dynamodb_table.invoices.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.approved_invoices.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = aws_secretsmanager_secret.slack_config.arn
+      }
+    ]
+  })
+}
+
+# Poster Role
+resource "aws_iam_role" "poster_role" {
+  name = "odoo-poster-role-${var.environment}"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
     }]
   })
 }
 
 resource "aws_iam_role_policy" "poster_policy" {
-  name = "qb-poster-policy"
+  name = "poster-policy"
   role = aws_iam_role.poster_role.id
   
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "CloudWatchLogs"
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ]
-        Resource = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:*"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:aws:logs:*:*:*"
       },
       {
-        Sid    = "S3Read"
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:DeleteObject",
-          "s3:CopyObject",
-          "s3:PutObject"
-        ]
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:DeleteObject", "s3:CopyObject", "s3:PutObject"]
         Resource = "${aws_s3_bucket.invoice_pdfs.arn}/*"
       },
       {
-        Sid    = "DynamoDB"
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:UpdateItem",
-          "dynamodb:Query"
-        ]
-        Resource = [
-          aws_dynamodb_table.invoices.arn,
-          "${aws_dynamodb_table.invoices.arn}/index/*"
-        ]
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+        Resource = [aws_dynamodb_table.invoices.arn, "${aws_dynamodb_table.invoices.arn}/index/*"]
       },
       {
-        Sid    = "SecretsManager"
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue"
-        ]
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
         Resource = aws_secretsmanager_secret.qb_credentials.arn
       },
       {
-        Sid    = "SNS"
-        Effect = "Allow"
-        Action = ["sns:Publish"]
-        Resource = aws_sns_topic.alerts.arn
+        Effect   = "Allow"
+        Action   = ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+        Resource = aws_sqs_queue.approved_invoices.arn
       },
       {
-        Sid    = "SQS"
-        Effect = "Allow"
-        Action = ["sqs:SendMessage"]
-        Resource = aws_sqs_queue.poster_dlq.arn
+        Effect   = "Allow"
+        Action   = ["sns:Publish"]
+        Resource = aws_sns_topic.alerts.arn
       }
     ]
   })
 }
 
-##############################################################################
 # Lambda Functions
-##############################################################################
 
 # Lambda 1: Odoo Extractor
-resource "aws_lambda_function" "odoo_extractor" {
-  filename         = "${path.module}/lambda/odoo_extractor.zip"
+resource "aws_lambda_function" "extractor" {
+  filename         = "${path.module}/lambda/extractor.zip"
   function_name    = "odoo-extractor-${var.environment}"
   role             = aws_iam_role.extractor_role.arn
-  handler          = "odoo_extractor.lambda_handler"
-  source_code_hash = filebase64sha256("${path.module}/lambda/odoo_extractor.zip")
+  handler          = "extractor.lambda_handler"
+  source_code_hash = filebase64sha256("${path.module}/lambda/extractor.zip")
   runtime          = "python3.12"
-  timeout          = 300 
+  timeout          = 300
   memory_size      = 512
   
   environment {
     variables = {
-      ENVIRONMENT       = var.environment
-      ODOO_API_URL      = var.odoo_api_url
-      ODOO_SECRET_ARN   = aws_secretsmanager_secret.odoo_credentials.arn
-      DYNAMODB_TABLE    = aws_dynamodb_table.invoices.name
-      S3_BUCKET         = aws_s3_bucket.invoice_pdfs.id
-      SNS_ALERT_TOPIC   = aws_sns_topic.alerts.arn
-      SLACK_WEBHOOK_URL = var.slack_webhook_url
+      ENVIRONMENT     = var.environment
+      ODOO_API_URL    = var.odoo_api_url
+      ODOO_SECRET_ARN = aws_secretsmanager_secret.odoo_credentials.arn
+      DYNAMODB_TABLE  = aws_dynamodb_table.invoices.name
+      S3_BUCKET       = aws_s3_bucket.invoice_pdfs.id
+      SNS_ALERT_TOPIC = aws_sns_topic.alerts.arn
     }
   }
   
   dead_letter_config {
     target_arn = aws_sqs_queue.extractor_dlq.arn
   }
-  
-  tags = {
-    Name = "Odoo Extractor"
-  }
 }
 
-# Lambda 2: QuickBooks Poster
-resource "aws_lambda_function" "qb_poster" {
-  filename         = "${path.module}/lambda/qb_poster.zip"
-  function_name    = "qb-poster-${var.environment}"
-  role             = aws_iam_role.poster_role.arn
-  handler          = "qb_poster.lambda_handler"
-  source_code_hash = filebase64sha256("${path.module}/lambda/qb_poster.zip")
+# Lambda 3: Slack Notifier
+resource "aws_lambda_function" "notifier" {
+  filename         = "${path.module}/lambda/notifier.zip"
+  function_name    = "odoo-notifier-${var.environment}"
+  role             = aws_iam_role.notifier_role.arn
+  handler          = "notifier.lambda_handler"
+  source_code_hash = filebase64sha256("${path.module}/lambda/notifier.zip")
   runtime          = "python3.12"
-  timeout          = 120  
+  timeout          = 30
   memory_size      = 256
   
   environment {
     variables = {
-      ENVIRONMENT       = var.environment
-      QB_SECRET_ARN     = aws_secretsmanager_secret.qb_credentials.arn
-      DYNAMODB_TABLE    = aws_dynamodb_table.invoices.name
-      S3_BUCKET         = aws_s3_bucket.invoice_pdfs.id
-      SNS_ALERT_TOPIC   = aws_sns_topic.alerts.arn
-      SLACK_WEBHOOK_URL = var.slack_webhook_url
+      ENVIRONMENT      = var.environment
+      SLACK_SECRET_ARN = aws_secretsmanager_secret.slack_config.arn
+      SLACK_CHANNEL_ID = var.slack_channel_id
+      DYNAMODB_TABLE   = aws_dynamodb_table.invoices.name
+      S3_BUCKET        = aws_s3_bucket.invoice_pdfs.id
+      APPROVAL_URL     = aws_lambda_function_url.approval_handler.function_url
     }
   }
+}
+
+# DynamoDB Stream trigger for Notifier
+resource "aws_lambda_event_source_mapping" "notifier_stream" {
+  event_source_arn  = aws_dynamodb_table.invoices.stream_arn
+  function_name     = aws_lambda_function.notifier.arn
+  starting_position = "LATEST"
+  batch_size        = 10
   
-  dead_letter_config {
-    target_arn = aws_sqs_queue.poster_dlq.arn
-  }
-  
-  tags = {
-    Name = "QuickBooks Poster"
+  filter_criteria {
+    filter {
+      pattern = jsonencode({
+        eventName = ["INSERT"]
+        dynamodb = {
+          NewImage = {
+            status = { S = ["READY_FOR_APPROVAL"] }
+          }
+        }
+      })
+    }
   }
 }
 
-# Lambda Permissions
-resource "aws_lambda_permission" "eventbridge_invoke_extractor" {
-  statement_id  = "AllowEventBridgeInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.odoo_extractor.function_name
-  principal     = "events.amazonaws.com"
-  source_arn    = aws_cloudwatch_event_rule.schedule.arn
+# Lambda 4: Approval Handler (with Function URL)
+resource "aws_lambda_function" "approval_handler" {
+  filename         = "${path.module}/lambda/approval_handler.zip"
+  function_name    = "odoo-approval-handler-${var.environment}"
+  role             = aws_iam_role.approval_role.arn
+  handler          = "approval_handler.lambda_handler"
+  source_code_hash = filebase64sha256("${path.module}/lambda/approval_handler.zip")
+  runtime          = "python3.12"
+  timeout          = 30
+  memory_size      = 256
+  
+  environment {
+    variables = {
+      ENVIRONMENT      = var.environment
+      DYNAMODB_TABLE   = aws_dynamodb_table.invoices.name
+      SQS_QUEUE_URL    = aws_sqs_queue.approved_invoices.url
+      SLACK_SECRET_ARN = aws_secretsmanager_secret.slack_config.arn
+    }
+  }
 }
 
-resource "aws_lambda_permission" "s3_invoke_qb_poster" {
-  statement_id  = "AllowS3Invoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.qb_poster.function_name
-  principal     = "s3.amazonaws.com"
-  source_arn    = aws_s3_bucket.invoice_pdfs.arn
+# Lambda Function URL for Approval Handler
+resource "aws_lambda_function_url" "approval_handler" {
+  function_name      = aws_lambda_function.approval_handler.function_name
+  authorization_type = "NONE"  # Slack handles auth via signing secret
+}
+
+# Lambda 2: QB Poster (SQS triggered)
+resource "aws_lambda_function" "poster" {
+  filename         = "${path.module}/lambda/poster.zip"
+  function_name    = "odoo-poster-${var.environment}"
+  role             = aws_iam_role.poster_role.arn
+  handler          = "poster.lambda_handler"
+  source_code_hash = filebase64sha256("${path.module}/lambda/poster.zip")
+  runtime          = "python3.12"
+  timeout          = 300
+  memory_size      = 256
+  
+  environment {
+    variables = {
+      ENVIRONMENT     = var.environment
+      QB_SECRET_ARN   = aws_secretsmanager_secret.qb_credentials.arn
+      DYNAMODB_TABLE  = aws_dynamodb_table.invoices.name
+      S3_BUCKET       = aws_s3_bucket.invoice_pdfs.id
+      SNS_ALERT_TOPIC = aws_sns_topic.alerts.arn
+    }
+  }
+}
+
+# SQS trigger for Poster
+resource "aws_lambda_event_source_mapping" "poster_sqs" {
+  event_source_arn = aws_sqs_queue.approved_invoices.arn
+  function_name    = aws_lambda_function.poster.arn
+  batch_size       = 1  # Process one at a time for QB rate limits
 }
 
 # EventBridge - Scheduled Trigger
@@ -510,81 +648,46 @@ resource "aws_cloudwatch_event_rule" "schedule" {
   name                = "odoo-extractor-schedule-${var.environment}"
   description         = "Trigger Odoo extractor on schedule"
   schedule_expression = var.schedule_rate
-  
-  tags = {
-    Name = "Odoo Extractor Schedule"
-  }
 }
 
 resource "aws_cloudwatch_event_target" "extractor" {
   rule      = aws_cloudwatch_event_rule.schedule.name
   target_id = "OdooExtractor"
-  arn       = aws_lambda_function.odoo_extractor.arn
+  arn       = aws_lambda_function.extractor.arn
 }
 
-# CloudWatch - Monitoring & Alarms
+resource "aws_lambda_permission" "eventbridge_invoke" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.extractor.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.schedule.arn
+}
 
-resource "aws_cloudwatch_log_group" "extractor_logs" {
-  name              = "/aws/lambda/${aws_lambda_function.odoo_extractor.function_name}"
+# CloudWatch Alarms
+
+resource "aws_cloudwatch_log_group" "extractor" {
+  name              = "/aws/lambda/${aws_lambda_function.extractor.function_name}"
   retention_in_days = 30
-  
-  tags = {
-    Name = "Odoo Extractor Logs"
-  }
 }
 
-resource "aws_cloudwatch_log_group" "poster_logs" {
-  name              = "/aws/lambda/${aws_lambda_function.qb_poster.function_name}"
+resource "aws_cloudwatch_log_group" "notifier" {
+  name              = "/aws/lambda/${aws_lambda_function.notifier.function_name}"
   retention_in_days = 30
-  
-  tags = {
-    Name = "QB Poster Logs"
-  }
 }
 
-# Extractor Error Alarm
-resource "aws_cloudwatch_metric_alarm" "extractor_errors" {
-  alarm_name          = "odoo-extractor-errors-${var.environment}"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "Odoo extractor errors detected"
-  
-  dimensions = {
-    FunctionName = aws_lambda_function.odoo_extractor.function_name
-  }
-  
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+resource "aws_cloudwatch_log_group" "approval" {
+  name              = "/aws/lambda/${aws_lambda_function.approval_handler.function_name}"
+  retention_in_days = 30
 }
 
-# Poster Error Alarm
-resource "aws_cloudwatch_metric_alarm" "poster_errors" {
-  alarm_name          = "qb-poster-errors-${var.environment}"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "QB poster errors detected"
-  
-  dimensions = {
-    FunctionName = aws_lambda_function.qb_poster.function_name
-  }
-  
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+resource "aws_cloudwatch_log_group" "poster" {
+  name              = "/aws/lambda/${aws_lambda_function.poster.function_name}"
+  retention_in_days = 30
 }
 
-# DLQ Message Alarms
-resource "aws_cloudwatch_metric_alarm" "extractor_dlq" {
-  alarm_name          = "odoo-extractor-dlq-${var.environment}"
+resource "aws_cloudwatch_metric_alarm" "dlq_messages" {
+  alarm_name          = "odoo-qb-dlq-messages-${var.environment}"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "ApproximateNumberOfMessagesVisible"
@@ -592,25 +695,7 @@ resource "aws_cloudwatch_metric_alarm" "extractor_dlq" {
   period              = 300
   statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "Messages in extractor DLQ"
-  
-  dimensions = {
-    QueueName = aws_sqs_queue.extractor_dlq.name
-  }
-  
-  alarm_actions = [aws_sns_topic.alerts.arn]
-}
-
-resource "aws_cloudwatch_metric_alarm" "poster_dlq" {
-  alarm_name          = "qb-poster-dlq-${var.environment}"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "ApproximateNumberOfMessagesVisible"
-  namespace           = "AWS/SQS"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "Messages in poster DLQ"
+  alarm_description   = "Messages in DLQ indicate failed processing"
   
   dimensions = {
     QueueName = aws_sqs_queue.poster_dlq.name
@@ -621,37 +706,31 @@ resource "aws_cloudwatch_metric_alarm" "poster_dlq" {
 
 # Outputs
 
-output "s3_bucket_name" {
+output "approval_handler_url" {
+  description = "URL for Slack button callbacks"
+  value       = aws_lambda_function_url.approval_handler.function_url
+}
+
+output "s3_bucket" {
   description = "S3 bucket for invoice PDFs"
   value       = aws_s3_bucket.invoice_pdfs.id
 }
 
-output "dynamodb_table_name" {
+output "dynamodb_table" {
   description = "DynamoDB table for invoice tracking"
   value       = aws_dynamodb_table.invoices.name
 }
 
-output "extractor_function_name" {
-  description = "Odoo extractor Lambda function"
-  value       = aws_lambda_function.odoo_extractor.function_name
+output "sqs_queue_url" {
+  description = "SQS queue for approved invoices"
+  value       = aws_sqs_queue.approved_invoices.url
 }
 
-output "poster_function_name" {
-  description = "QB poster Lambda function"
-  value       = aws_lambda_function.qb_poster.function_name
-}
-
-output "odoo_secret_arn" {
-  description = "Odoo credentials secret ARN"
-  value       = aws_secretsmanager_secret.odoo_credentials.arn
-}
-
-output "qb_secret_arn" {
-  description = "QuickBooks credentials secret ARN"
-  value       = aws_secretsmanager_secret.qb_credentials.arn
-}
-
-output "sns_topic_arn" {
-  description = "SNS alerts topic ARN"
-  value       = aws_sns_topic.alerts.arn
+output "secrets_to_configure" {
+  description = "Secrets that need to be configured manually"
+  value = {
+    odoo  = aws_secretsmanager_secret.odoo_credentials.name
+    qb    = aws_secretsmanager_secret.qb_credentials.name
+    slack = aws_secretsmanager_secret.slack_config.name
+  }
 }
