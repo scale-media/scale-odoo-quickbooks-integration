@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 # Configuration
 ODOO_URL = "https://scalemedia.odoo.com"
 ODOO_DB = "2jaszgithub-scale-media-master-305444"
-ODOO_USERNAME = "lerone.pieters@scale.tech"
+ODOO_USERNAME = ""
 ODOO_API_KEY = 'os.environ.get("ODOO_API_KEY", "")'
 
 # Output directory for downloaded PDFs

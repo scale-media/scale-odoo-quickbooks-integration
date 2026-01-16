@@ -91,6 +91,10 @@ Secrets payloads are generated from these variables and stored in Secrets Manage
 
 All functions publish logs to CloudWatch. Poster and Extractor have DLQs/alarms configured via SQS.
 
+Optional testing flags:
+- Extractor: `DRY_RUN=true`, `TEST_START_DATE=YYYY-MM-DD HH:MM:SS`
+- Poster: `DRY_RUN=true`, `QB_USE_SANDBOX=true`
+
 ---
 
 ## Build and Deploy
@@ -166,6 +170,7 @@ Terraform outputs include:
 - SQS queue URL for approved invoices
 - Names/ARNs for Lambdas and Secrets
 - SNS alerts topic ARN
+- `secrets_to_configure` (friendly names of Secrets to review in AWS)
 
 ---
 
@@ -199,6 +204,19 @@ Test the approval handler (ensure Slack signature disabled in dev or provide pro
 ```bash
 curl -X POST "<approval_handler_url>" --data-urlencode 'payload={"type":"block_actions","user":{"id":"U123","username":"tester"},"actions":[{"action_id":"approve_invoice","value":"<entry_id>"}],"response_url":"https://hooks.slack.com/actions/..."}'
 ```
+
+---
+
+## Local testing
+
+Use `test_odoo.py` to validate Odoo JSON-RPC connectivity and download a few recent bill PDFs locally:
+
+```bash
+export ODOO_API_KEY="your_api_key_here"
+python test_odoo.py
+```
+
+PDFs will be saved under `./downloaded_pdfs/`.
 
 ---
 

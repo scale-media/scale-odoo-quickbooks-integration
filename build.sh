@@ -35,7 +35,7 @@ build_lambda() {
     cd "$name"
     zip -r "$LAMBDA_DIR/${name}.zip" . -q
     local size=$(du -h "$LAMBDA_DIR/${name}.zip" | cut -f1)
-    echo "${name}.zip ($size)"
+    echo "    ${name}.zip ($size)"
 }
 
 # Build all Lambdas

@@ -13,8 +13,8 @@ override.tf.json
 *_override.tf.json
 
 # Lambda deployment package
-lambda_function.zip
-lambda/
+lambda/*.zip
+
 
 # Sensitive data
 secrets/
@@ -51,3 +51,4 @@ env/
 # AWS
 response.json
 *.bak
+build/
