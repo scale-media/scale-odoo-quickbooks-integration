@@ -1,7 +1,7 @@
 """
 Lambda 4: Approval Handler
 
-Lambda Function URL that handles Slack interactive button clicks.
+Lambda Function URL / API Gateway that handles Slack interactive button clicks.
 Updates DynamoDB status and enqueues approved invoices to SQS.
 """
 
@@ -11,6 +11,7 @@ import hmac
 import hashlib
 import logging
 import time
+import base64
 from datetime import datetime
 from urllib.parse import parse_qs
 
@@ -67,27 +68,33 @@ def get_slack_config() -> dict:
         raise
 
 
-def verify_slack_signature(event: dict, signing_secret: str) -> bool:
-    """Verify request is from Slack using signing secret."""
+def verify_slack_signature(headers: dict, body: str, signing_secret: str) -> bool:
+    """
+    Verify request is from Slack using signing secret.
+    
+    IMPORTANT: body must be the decoded string (not base64), as Slack signs the actual payload.
+    """
     
     # Skip verification if no signing secret (dev mode)
     if not signing_secret:
         logger.warning("Slack signing secret not configured - skipping verification")
         return True
     
-    headers = event.get("headers", {})
-    # Lambda Function URL headers are lowercase
+    # Lambda Function URL / API Gateway headers are lowercase
     timestamp = headers.get("x-slack-request-timestamp", "")
     signature = headers.get("x-slack-signature", "")
-    body = event.get("body", "")
     
     if not timestamp or not signature:
-        logger.error("Missing Slack signature headers")
+        logger.error(f"Missing Slack signature headers. Headers present: {list(headers.keys())}")
         return False
     
     # Check timestamp is recent (within 5 minutes)
-    if abs(time.time() - int(timestamp)) > 300:
-        logger.error("Slack timestamp too old")
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            logger.error("Slack timestamp too old")
+            return False
+    except ValueError:
+        logger.error(f"Invalid timestamp: {timestamp}")
         return False
     
     # Compute expected signature
@@ -100,6 +107,8 @@ def verify_slack_signature(event: dict, signing_secret: str) -> bool:
     
     if not hmac.compare_digest(expected, signature):
         logger.error("Slack signature mismatch")
+        logger.debug(f"Expected: {expected[:20]}...")
+        logger.debug(f"Received: {signature[:20]}...")
         return False
     
     return True
@@ -418,29 +427,28 @@ def handle_modal_submit(payload: dict) -> dict:
 
 
 def lambda_handler(event, context):
-    """Handle Lambda Function URL requests from Slack."""
+    """Handle API Gateway / Lambda Function URL requests from Slack."""
     
     logger.info(f"Received request: {event.get('requestContext', {}).get('http', {}).get('method')}")
     
     # Get Slack config for verification
     config = get_slack_config()
     
-    # Verify request is from Slack
-    if not verify_slack_signature(event, config.get("signing_secret", "")):
+    # Get body - decode if base64 encoded
+    body = event.get("body", "")
+    if event.get("isBase64Encoded"):
+        body = base64.b64decode(body).decode("utf-8")
+    
+    # Verify request is from Slack (using decoded body)
+    headers = event.get("headers", {})
+    if not verify_slack_signature(headers, body, config.get("signing_secret", "")):
+        logger.error("Slack signature verification failed")
         return {
             "statusCode": 401,
             "body": "Invalid signature"
         }
     
-    # Parse body
-    body = event.get("body", "")
-    
-    # Handle URL-encoded form data from Slack
-    if event.get("isBase64Encoded"):
-        import base64
-        body = base64.b64decode(body).decode("utf-8")
-    
-    # Parse the payload
+    # Parse the payload (body is already decoded)
     try:
         parsed = parse_qs(body)
         payload_str = parsed.get("payload", ["{}"])[0]

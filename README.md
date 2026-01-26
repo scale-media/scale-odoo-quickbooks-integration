@@ -17,8 +17,8 @@ Automated, approval-based pipeline that extracts vendor bills from Odoo, routes 
   - Triggered by DynamoDB Streams on new `READY_FOR_APPROVAL` records
   - Builds Slack Block Kit message with invoice details + Approve/Reject buttons
   - Posts to a configured Slack channel and records the Slack message timestamp
-- Approval Handler (Lambda Function URL):
-  - Target for Slack interactive button clicks (Approve/Reject/View PDF)
+- Approval Handler (API Gateway HTTP API → Lambda):
+  - Target for Slack interactive button clicks (Approve/Reject/View PDF) via API Gateway URL
   - Verifies Slack signing secret, updates DynamoDB status
   - On Approve: enqueues invoice to SQS for posting
 - QuickBooks Poster (Lambda):
@@ -43,11 +43,12 @@ This configuration provisions:
   - `odoo-qb-integration/odoo-credentials-<env>`
   - `odoo-qb-integration/quickbooks-credentials-<env>`
   - `odoo-qb-integration/slack-config-<env>`
+- API Gateway HTTP API for the Slack approval callback (with access logs)
 - IAM roles/policies for Lambdas (Logs, S3, DynamoDB, Secrets, SNS, SQS)
 - Lambda functions (Python 3.12):
   - `odoo-extractor-<env>` (300s, 512 MB) — EventBridge scheduled
   - `odoo-notifier-<env>` (30s, 256 MB) — DynamoDB Stream triggered
-  - `odoo-approval-handler-<env>` (30s, 256 MB) — Function URL (Slack)
+  - `odoo-approval-handler-<env>` (30s, 256 MB) — API Gateway (Slack)
   - `odoo-poster-<env>` (300s, 256 MB) — SQS triggered
 - SQS queue for approved invoices + DLQ for poster
 - EventBridge rule and target for scheduled extraction
@@ -70,9 +71,8 @@ This configuration provisions:
   - `odoo_database`, `odoo_username`, `odoo_api_key` (sensitive)
 - QuickBooks:
   - `qb_client_id`, `qb_client_secret` (sensitive)
-  - `qb_refresh_token` (sensitive)
-  - `qb_realm_ids` (map of company → realm ID)
   - `qb_use_sandbox` (bool, default `false`)
+  - `qb_credentials` (map of company → `{ realm_id, refresh_token }`)
 
 Secrets payloads are generated from these variables and stored in Secrets Manager by Terraform.
 
@@ -84,7 +84,7 @@ Secrets payloads are generated from these variables and stored in Secrets Manage
   - Env: `ENVIRONMENT`, `ODOO_API_URL`, `ODOO_SECRET_ARN`, `DYNAMODB_TABLE`, `S3_BUCKET`, `SNS_ALERT_TOPIC`
 - Notifier (`notifier.lambda_handler`)
   - Env: `ENVIRONMENT`, `SLACK_SECRET_ARN`, `SLACK_CHANNEL_ID`, `DYNAMODB_TABLE`, `S3_BUCKET`, `APPROVAL_URL`
-- Approval Handler (`approval_handler.lambda_handler`)
+- Approval Handler (`approval_handler.lambda_handler`) via API Gateway
   - Env: `ENVIRONMENT`, `DYNAMODB_TABLE`, `SQS_QUEUE_URL`, `SLACK_SECRET_ARN`
 - Poster (`poster.lambda_handler`)
   - Env: `ENVIRONMENT`, `QB_SECRET_ARN`, `DYNAMODB_TABLE`, `S3_BUCKET`, `SNS_ALERT_TOPIC`
@@ -131,14 +131,27 @@ odoo_api_key  = "********"
 # QuickBooks
 qb_client_id     = "********"
 qb_client_secret = "********"
-qb_refresh_token = "********"
-qb_realm_ids = {
-  "1MD"               = "1234567890"
-  "LiveConscious"     = "2345678901"
-  "EssentialElements" = "3456789012"
-  "TruAlchemy"        = "4567890123"
-}
 qb_use_sandbox = false
+
+# Per-brand credentials (realm_id and refresh_token per company)
+qb_credentials = {
+  "1MD" = {
+    realm_id      = "1234567890"
+    refresh_token = "********"
+  }
+  "LiveConscious" = {
+    realm_id      = "2345678901"
+    refresh_token = "********"
+  }
+  "EssentialElements" = {
+    realm_id      = "3456789012"
+    refresh_token = "********"
+  }
+  "TruAlchemy" = {
+    realm_id      = "4567890123"
+    refresh_token = "********"
+  }
+}
 ```
 
 Terraform will create/update the Secrets Manager values from these variables.
@@ -164,7 +177,7 @@ terraform apply tfplan
 ```
 
 Terraform outputs include:
-- `approval_handler_url` (configure this as the Slack interactivity endpoint)
+- `approval_handler_url` (API Gateway URL for Slack Interactivity endpoint)
 - S3 bucket name
 - DynamoDB table name
 - SQS queue URL for approved invoices
@@ -181,6 +194,7 @@ Terraform outputs include:
   - `/aws/lambda/odoo-notifier-<env>`
   - `/aws/lambda/odoo-approval-handler-<env>`
   - `/aws/lambda/odoo-poster-<env>`
+  - `/aws/apigateway/odoo-slack-approval-<env>`
 - Data flow:
   - Extractor writes PDFs to `s3://<bucket>/pending/<company>/<entry_id>.pdf`
   - Extractor writes `READY_FOR_APPROVAL` items to DynamoDB

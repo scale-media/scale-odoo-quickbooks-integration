@@ -1,6 +1,3 @@
-# Odoo → QuickBooks Integration with Approval Flow
-# Copy to terraform.tfvars and fill in values
-
 # AWS Configuration
 aws_region  = "us-west-2"
 environment = "prod"
@@ -13,35 +10,45 @@ schedule_rate = "rate(15 minutes)"
 
 # Odoo Configuration
 odoo_api_url  = "https://scalemedia.odoo.com"
-odoo_database = "odoo_database"
-odoo_username = "odoo_username"
-odoo_api_key  = "odoo_api_key_here"
+odoo_database = "2jaszgithub-scale-media-master-305444"
+odoo_username = ""
+odoo_api_key  = "your_odoo_api_key_here"
 
 # QuickBooks Configuration
 # Get from Intuit Developer Portal: https://developer.intuit.com/
 qb_client_id     = "your_qb_client_id"
 qb_client_secret = "your_qb_client_secret"
-qb_refresh_token = "your_qb_refresh_token"
 
 # Set to true for testing with QB sandbox
 qb_use_sandbox = false
 
-# Realm IDs for each company (get from QB OAuth flow)
-# Leave empty for companies not yet configured
-qb_realm_ids = {
-  "1MD"               = ""
-  "LiveConscious"     = ""
-  "EssentialElements" = ""
-  "TruAlchemy"        = ""
+# Per-brand credentials (realm_id and refresh_token for each)
+# Get these by authorizing your app for each QB company via OAuth Playground
+qb_credentials = {
+  "1MD" = {
+    realm_id      = ""  # Digital Med LLC
+    refresh_token = ""
+  }
+  "LiveConscious" = {
+    realm_id      = ""  # NEW MOMENTUM MEDIA INC
+    refresh_token = ""
+  }
+  "EssentialElements" = {
+    realm_id      = ""  # INFINITE FOCUS, INC.
+    refresh_token = ""
+  }
+  "TruAlchemy" = {
+    realm_id      = ""  # Direct Insight LLC
+    refresh_token = ""
+  }
 }
 
 # Slack Configuration
 # Channel ID: right-click channel → Copy link → ID is at end of URL
-slack_channel_id = ""
+slack_channel_id = "C0123456789"
 
 # From: Slack App → OAuth & Permissions → Bot User OAuth Token
 slack_bot_token = "xoxb-your-bot-token-here"
 
 # From: Slack App → Basic Information → Signing Secret
 slack_signing_secret = "your_signing_secret_here"
-

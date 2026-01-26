@@ -99,21 +99,31 @@ variable "qb_client_secret" {
   sensitive   = true
 }
 
-variable "qb_refresh_token" {
-  description = "QuickBooks OAuth refresh token"
-  type        = string
-  sensitive   = true
-}
-
-variable "qb_realm_ids" {
-  description = "QuickBooks realm IDs per company"
-  type        = map(string)
-  default     = {
-    "1MD"              = ""
-    "LiveConscious"    = ""
-    "EssentialElements" = ""
-    "TruAlchemy"       = ""
+variable "qb_credentials" {
+  description = "QuickBooks credentials per company (realm_id and refresh_token)"
+  type = map(object({
+    realm_id      = string
+    refresh_token = string
+  }))
+  default = {
+    "1MD" = {
+      realm_id      = ""
+      refresh_token = ""
+    }
+    "LiveConscious" = {
+      realm_id      = ""
+      refresh_token = ""
+    }
+    "EssentialElements" = {
+      realm_id      = ""
+      refresh_token = ""
+    }
+    "TruAlchemy" = {
+      realm_id      = ""
+      refresh_token = ""
+    }
   }
+  sensitive = true
 }
 
 variable "qb_use_sandbox" {
@@ -146,6 +156,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "invoice_pdfs" {
   rule {
     id     = "archive-old-invoices"
     status = "Enabled"
+
+    filter {}
     
     transition {
       days          = 90
@@ -284,17 +296,16 @@ resource "aws_secretsmanager_secret" "qb_credentials" {
 resource "aws_secretsmanager_secret_version" "qb_credentials" {
   secret_id = aws_secretsmanager_secret.qb_credentials.id
   secret_string = jsonencode({
-    client_id      = var.qb_client_id
-    client_secret  = var.qb_client_secret
-    refresh_token  = var.qb_refresh_token
-    realm_ids      = var.qb_realm_ids
-    use_sandbox    = var.qb_use_sandbox
+    client_id     = var.qb_client_id
+    client_secret = var.qb_client_secret
+    use_sandbox   = var.qb_use_sandbox
+    credentials   = var.qb_credentials
   })
 }
 
 resource "aws_secretsmanager_secret" "slack_config" {
   name        = "odoo-qb-integration/slack-config-${var.environment}"
-  description = "Slack bot token and signing secret"
+  description = "Slack bot configuration"
 }
 
 resource "aws_secretsmanager_secret_version" "slack_config" {
@@ -341,7 +352,7 @@ resource "aws_iam_role_policy" "extractor_policy" {
       },
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"]
+        Action   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
         Resource = [aws_dynamodb_table.invoices.arn, "${aws_dynamodb_table.invoices.arn}/index/*"]
       },
       {
@@ -391,13 +402,8 @@ resource "aws_iam_role_policy" "notifier_policy" {
       },
       {
         Effect   = "Allow"
-        Action   = ["dynamodb:GetRecords", "dynamodb:GetShardIterator", "dynamodb:DescribeStream", "dynamodb:ListStreams"]
-        Resource = aws_dynamodb_table.invoices.stream_arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
-        Resource = aws_dynamodb_table.invoices.arn
+        Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:DescribeStream", "dynamodb:GetRecords", "dynamodb:GetShardIterator", "dynamodb:ListStreams"]
+        Resource = [aws_dynamodb_table.invoices.arn, "${aws_dynamodb_table.invoices.arn}/stream/*"]
       },
       {
         Effect   = "Allow"
@@ -560,7 +566,7 @@ resource "aws_lambda_function" "notifier" {
       SLACK_CHANNEL_ID = var.slack_channel_id
       DYNAMODB_TABLE   = aws_dynamodb_table.invoices.name
       S3_BUCKET        = aws_s3_bucket.invoice_pdfs.id
-      APPROVAL_URL     = aws_lambda_function_url.approval_handler.function_url
+      APPROVAL_URL     = aws_apigatewayv2_stage.approval.invoke_url  # Changed to API Gateway
     }
   }
 }
@@ -586,7 +592,7 @@ resource "aws_lambda_event_source_mapping" "notifier_stream" {
   }
 }
 
-# Lambda 4: Approval Handler (with Function URL)
+# Lambda 4: Approval Handler
 resource "aws_lambda_function" "approval_handler" {
   filename         = "${path.module}/lambda/approval_handler.zip"
   function_name    = "odoo-approval-handler-${var.environment}"
@@ -607,10 +613,57 @@ resource "aws_lambda_function" "approval_handler" {
   }
 }
 
-# Lambda Function URL for Approval Handler
-resource "aws_lambda_function_url" "approval_handler" {
-  function_name      = aws_lambda_function.approval_handler.function_name
-  authorization_type = "NONE"  # Slack handles auth via signing secret
+# API Gateway HTTP API for Approval Handler (replaces Function URL)
+resource "aws_apigatewayv2_api" "approval" {
+  name          = "odoo-slack-approval-${var.environment}"
+  protocol_type = "HTTP"
+  description   = "API Gateway for Slack approval button callbacks"
+}
+
+resource "aws_apigatewayv2_stage" "approval" {
+  api_id      = aws_apigatewayv2_api.approval.id
+  name        = "$default"
+  auto_deploy = true
+  
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.api_gateway.arn
+    format = jsonencode({
+      requestId      = "$context.requestId"
+      ip             = "$context.identity.sourceIp"
+      requestTime    = "$context.requestTime"
+      httpMethod     = "$context.httpMethod"
+      routeKey       = "$context.routeKey"
+      status         = "$context.status"
+      responseLength = "$context.responseLength"
+      errorMessage   = "$context.error.message"
+    })
+  }
+}
+
+resource "aws_apigatewayv2_integration" "approval_lambda" {
+  api_id                 = aws_apigatewayv2_api.approval.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.approval_handler.invoke_arn
+  payload_format_version = "2.0"
+}
+
+resource "aws_apigatewayv2_route" "approval_post" {
+  api_id    = aws_apigatewayv2_api.approval.id
+  route_key = "POST /"
+  target    = "integrations/${aws_apigatewayv2_integration.approval_lambda.id}"
+}
+
+resource "aws_lambda_permission" "api_gateway_invoke" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.approval_handler.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.approval.execution_arn}/*/*"
+}
+
+resource "aws_cloudwatch_log_group" "api_gateway" {
+  name              = "/aws/apigateway/odoo-slack-approval-${var.environment}"
+  retention_in_days = 14
 }
 
 # Lambda 2: QB Poster (SQS triggered)
@@ -707,8 +760,8 @@ resource "aws_cloudwatch_metric_alarm" "dlq_messages" {
 # Outputs
 
 output "approval_handler_url" {
-  description = "URL for Slack button callbacks"
-  value       = aws_lambda_function_url.approval_handler.function_url
+  description = "API Gateway URL for Slack button callbacks (use this in Slack app Interactivity settings)"
+  value       = aws_apigatewayv2_stage.approval.invoke_url
 }
 
 output "s3_bucket" {

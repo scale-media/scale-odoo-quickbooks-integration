@@ -198,8 +198,8 @@ def get_qb_credentials() -> dict:
         return {
             "client_id": os.environ.get("QB_CLIENT_ID", ""),
             "client_secret": os.environ.get("QB_CLIENT_SECRET", ""),
-            "refresh_token": os.environ.get("QB_REFRESH_TOKEN", ""),
-            "realm_ids": json.loads(os.environ.get("QB_REALM_IDS", "{}")),
+            "use_sandbox": os.environ.get("QB_USE_SANDBOX", "false").lower() == "true",
+            "companies": json.loads(os.environ.get("QB_COMPANIES", "{}")),
         }
     
     try:
@@ -210,15 +210,16 @@ def get_qb_credentials() -> dict:
         raise
 
 
-def update_qb_credentials(new_refresh_token: str, credentials: dict):
-    """Update refresh token in Secrets Manager."""
+def update_qb_refresh_token(company: str, new_refresh_token: str, credentials: dict):
+    """Update refresh token for a specific company in Secrets Manager."""
     if not QB_SECRET_ARN:
         return
     
     try:
-        credentials["refresh_token"] = new_refresh_token
-        secrets_client.put_secret_value(SecretId=QB_SECRET_ARN, SecretString=json.dumps(credentials))
-        logger.info("Updated QB refresh token")
+        if company in credentials.get("companies", {}):
+            credentials["companies"][company]["refresh_token"] = new_refresh_token
+            secrets_client.put_secret_value(SecretId=QB_SECRET_ARN, SecretString=json.dumps(credentials))
+            logger.info(f"Updated QB refresh token for {company}")
     except ClientError as e:
         logger.error(f"Failed to update QB credentials: {e}")
 
@@ -372,7 +373,7 @@ def build_qb_bill(invoice: dict, qb: QuickBooksClient, account_cache: dict) -> d
     return {
         "VendorRef": {"value": vendor_id},
         "Line": lines,
-        "DocNumber": (invoice.get("bill_reference") or "")[:21],
+        "DocNumber": (invoice.get("bill_reference") or invoice.get("entry_id", "").replace("/", "-"))[:21],
         "TxnDate": invoice.get("bill_date"),
         "DueDate": invoice.get("due_date"),
         "PrivateNote": (invoice.get("po_number") or "")[:4000],
@@ -419,17 +420,23 @@ def process_invoice(entry_id: str) -> bool:
     try:
         # Get QB credentials
         credentials = get_qb_credentials()
-        realm_ids = credentials.get("realm_ids", {})
-        realm_id = realm_ids.get(company)
+        companies = credentials.get("companies", {})
+        company_creds = companies.get(company)
         
-        if not realm_id:
-            raise Exception(f"No QB realm for company: {company}")
+        if not company_creds:
+            raise Exception(f"No QB credentials for company: {company}")
+        
+        realm_id = company_creds.get("realm_id")
+        refresh_token = company_creds.get("refresh_token")
+        
+        if not realm_id or not refresh_token:
+            raise Exception(f"Missing realm_id or refresh_token for company: {company}")
         
         # Initialize QB client
         qb = QuickBooksClient(
             client_id=credentials["client_id"],
             client_secret=credentials["client_secret"],
-            refresh_token=credentials["refresh_token"],
+            refresh_token=refresh_token,
             realm_id=realm_id
         )
         
@@ -464,8 +471,8 @@ def process_invoice(entry_id: str) -> bool:
                     logger.warning(f"PDF attachment failed (non-fatal): {e}")
         
         # Update refresh token if changed
-        if qb.refresh_token != credentials["refresh_token"]:
-            update_qb_credentials(qb.refresh_token, credentials)
+        if qb.refresh_token != refresh_token:
+            update_qb_refresh_token(company, qb.refresh_token, credentials)
         
         # Update status
         update_invoice_status(entry_id, STATUS_POSTED, qb_bill_id=qb_bill_id)
