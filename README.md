@@ -10,6 +10,7 @@ Automated, approval-based pipeline that extracts vendor bills from Odoo, routes 
   - Scheduled by EventBridge (`rate(...)`)
   - Reads Odoo credentials from AWS Secrets Manager
   - Fetches posted vendor bills and validates data
+  - Checks QuickBooks for existing bills to avoid duplicates
   - Uploads PDFs to S3 under `pending/<company>/<entry_id>.pdf`
   - Writes records to DynamoDB with `status=READY_FOR_APPROVAL`
   - Publishes failure alerts to SNS
@@ -81,7 +82,7 @@ Secrets payloads are generated from these variables and stored in Secrets Manage
 ## Lambda Functions
 
 - Extractor (`extractor.lambda_handler`)
-  - Env: `ENVIRONMENT`, `ODOO_API_URL`, `ODOO_SECRET_ARN`, `DYNAMODB_TABLE`, `S3_BUCKET`, `SNS_ALERT_TOPIC`
+  - Env: `ENVIRONMENT`, `ODOO_API_URL`, `ODOO_SECRET_ARN`, `QB_SECRET_ARN`, `DYNAMODB_TABLE`, `S3_BUCKET`, `SNS_ALERT_TOPIC`, `QB_USE_SANDBOX`, `SKIP_QB_CHECK`
 - Notifier (`notifier.lambda_handler`)
   - Env: `ENVIRONMENT`, `SLACK_SECRET_ARN`, `SLACK_CHANNEL_ID`, `DYNAMODB_TABLE`, `S3_BUCKET`, `APPROVAL_URL`
 - Approval Handler (`approval_handler.lambda_handler`) via API Gateway
@@ -92,7 +93,7 @@ Secrets payloads are generated from these variables and stored in Secrets Manage
 All functions publish logs to CloudWatch. Poster and Extractor have DLQs/alarms configured via SQS.
 
 Optional testing flags:
-- Extractor: `DRY_RUN=true`, `TEST_START_DATE=YYYY-MM-DD HH:MM:SS`
+- Extractor: `DRY_RUN=true`, `TEST_START_DATE=YYYY-MM-DD HH:MM:SS`, `SKIP_QB_CHECK=true`, `QB_USE_SANDBOX=true`
 - Poster: `DRY_RUN=true`, `QB_USE_SANDBOX=true`
 
 ---
@@ -198,6 +199,7 @@ Terraform outputs include:
 - Data flow:
   - Extractor writes PDFs to `s3://<bucket>/pending/<company>/<entry_id>.pdf`
   - Extractor writes `READY_FOR_APPROVAL` items to DynamoDB
+  - Extractor may also write `VALIDATION_FAILED` or `ALREADY_IN_QB` based on checks
   - Notifier (DDB Stream) sends Slack Approve/Reject
   - Approval Handler updates status and enqueues SQS
   - Poster consumes SQS, posts to QuickBooks, updates DynamoDB

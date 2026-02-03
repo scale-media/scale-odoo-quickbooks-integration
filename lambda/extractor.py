@@ -9,6 +9,7 @@ Validation Rules:
 - Amount > 0
 - Line items sum matches total (within tolerance)
 - Not a duplicate (check DynamoDB)
+- Not already in QuickBooks
 - Company is known/mapped
 """
 
@@ -31,6 +32,7 @@ logger.setLevel(logging.INFO)
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "dev")
 ODOO_API_URL = os.environ.get("ODOO_API_URL", "https://scalemedia.odoo.com")
 ODOO_SECRET_ARN = os.environ.get("ODOO_SECRET_ARN", "")
+QB_SECRET_ARN = os.environ.get("QB_SECRET_ARN", "")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "odoo-qb-invoices")
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 SNS_ALERT_TOPIC = os.environ.get("SNS_ALERT_TOPIC", "")
@@ -38,6 +40,8 @@ SNS_ALERT_TOPIC = os.environ.get("SNS_ALERT_TOPIC", "")
 # Test flags
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 TEST_START_DATE = os.environ.get("TEST_START_DATE", "")
+QB_USE_SANDBOX = os.environ.get("QB_USE_SANDBOX", "false").lower() == "true"
+SKIP_QB_CHECK = os.environ.get("SKIP_QB_CHECK", "false").lower() == "true"
 
 # AWS clients
 secrets_client = boto3.client("secretsmanager")
@@ -51,6 +55,7 @@ table = dynamodb.Table(DYNAMODB_TABLE) if DYNAMODB_TABLE else None
 STATUS_READY_FOR_APPROVAL = "READY_FOR_APPROVAL"
 STATUS_VALIDATION_FAILED = "VALIDATION_FAILED"
 STATUS_DUPLICATE = "DUPLICATE"
+STATUS_ALREADY_IN_QB = "ALREADY_IN_QB"
 
 # Company mapping
 COMPANY_MAP = {
@@ -68,6 +73,7 @@ COMPANY_MAP = {
     "True Form Health, Inc. dba Tru Alchemy": "TruAlchemy",
     "True Form Health, Inc": "TruAlchemy",
     "Tru Alchemy": "TruAlchemy",
+    "Direct Insight LLC": "TruAlchemy",
     "Beauty Science Group, Inc. dba Hair La Vie": "HairLaVie",
     "Scale Media, Inc.": "ScaleMedia",
 }
@@ -240,6 +246,73 @@ class OdooClient:
         return None
 
 
+class QuickBooksChecker:
+    """Lightweight QB client just for checking if bills exist."""
+    
+    def __init__(self, client_id: str, client_secret: str, use_sandbox: bool = False):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.use_sandbox = use_sandbox
+        self.base_url = "https://sandbox-quickbooks.api.intuit.com" if use_sandbox else "https://quickbooks.api.intuit.com"
+        self.access_tokens: Dict[str, str] = {}  # realm_id -> access_token
+    
+    def get_access_token(self, refresh_token: str, realm_id: str) -> Optional[str]:
+        """Get access token for a specific realm."""
+        if realm_id in self.access_tokens:
+            return self.access_tokens[realm_id]
+        
+        try:
+            resp = requests.post(
+                "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+                auth=(self.client_id, self.client_secret),
+                data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+                headers={"Accept": "application/json"},
+                timeout=30
+            )
+            
+            if resp.status_code == 200:
+                token = resp.json().get("access_token")
+                self.access_tokens[realm_id] = token
+                return token
+            else:
+                logger.warning(f"QB token refresh failed for realm {realm_id}: {resp.status_code}")
+                return None
+        except Exception as e:
+            logger.warning(f"QB token refresh error for realm {realm_id}: {e}")
+            return None
+    
+    def bill_exists(self, realm_id: str, access_token: str, vendor_name: str, doc_number: str) -> bool:
+        """Check if bill exists in QuickBooks."""
+        if not doc_number:
+            return False
+        
+        # Escape single quotes in doc_number
+        safe_doc = doc_number.replace("'", "\\'")
+        query = f"SELECT Id FROM Bill WHERE DocNumber = '{safe_doc}'"
+        
+        try:
+            resp = requests.get(
+                f"{self.base_url}/v3/company/{realm_id}/query",
+                params={"query": query},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json"
+                },
+                timeout=30
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                bills = data.get("QueryResponse", {}).get("Bill", [])
+                return len(bills) > 0
+            else:
+                logger.warning(f"QB query failed: {resp.status_code}")
+                return False
+        except Exception as e:
+            logger.warning(f"QB query error: {e}")
+            return False
+
+
 def get_odoo_credentials() -> dict:
     """Get Odoo credentials from Secrets Manager or env."""
     if not ODOO_SECRET_ARN:
@@ -257,6 +330,59 @@ def get_odoo_credentials() -> dict:
         raise
 
 
+def get_qb_credentials() -> Optional[dict]:
+    """Get QB credentials from Secrets Manager."""
+    if not QB_SECRET_ARN:
+        return None
+    
+    try:
+        resp = secrets_client.get_secret_value(SecretId=QB_SECRET_ARN)
+        return json.loads(resp["SecretString"])
+    except ClientError as e:
+        logger.warning(f"Failed to get QB credentials: {e}")
+        return None
+
+
+def init_qb_checker() -> Optional[QuickBooksChecker]:
+    """Initialize QB checker if credentials available."""
+    if SKIP_QB_CHECK:
+        logger.info("QB duplicate check disabled via SKIP_QB_CHECK")
+        return None
+    
+    creds = get_qb_credentials()
+    if not creds:
+        logger.info("No QB credentials - skipping QB duplicate check")
+        return None
+    
+    return QuickBooksChecker(
+        client_id=creds["client_id"],
+        client_secret=creds["client_secret"],
+        use_sandbox=creds.get("use_sandbox", QB_USE_SANDBOX)
+    )
+
+
+def check_exists_in_qb(qb: QuickBooksChecker, qb_creds: dict, company: str, vendor_name: str, doc_number: str) -> bool:
+    """Check if bill already exists in QuickBooks for the given company."""
+    if not qb or not qb_creds:
+        return False
+    
+    companies = qb_creds.get("companies", {})
+    company_creds = companies.get(company)
+    
+    if not company_creds or not company_creds.get("realm_id") or not company_creds.get("refresh_token"):
+        logger.debug(f"No QB credentials for company {company}")
+        return False
+    
+    realm_id = company_creds["realm_id"]
+    refresh_token = company_creds["refresh_token"]
+    
+    access_token = qb.get_access_token(refresh_token, realm_id)
+    if not access_token:
+        return False
+    
+    return qb.bill_exists(realm_id, access_token, vendor_name, doc_number)
+
+
 def is_duplicate(entry_id: str) -> bool:
     """Check if entry exists in DynamoDB."""
     if not table:
@@ -268,7 +394,7 @@ def is_duplicate(entry_id: str) -> bool:
         return False
 
 
-def validate_invoice(invoice_data: dict) -> Tuple[bool, List[str]]:
+def validate_invoice(invoice_data: dict, qb: Optional[QuickBooksChecker] = None, qb_creds: Optional[dict] = None) -> Tuple[bool, List[str]]:
     """
     Validate invoice data.
     Returns (is_valid, list_of_issues).
@@ -308,7 +434,7 @@ def validate_invoice(invoice_data: dict) -> Tuple[bool, List[str]]:
     
     # Intercompany check
     vendor_lower = (invoice_data.get("vendor_name") or "").lower()
-    intercompany = ["scale media", "1md", "liveconscious", "essential elements", "tru alchemy"]
+    intercompany = ["scale media", "1md", "liveconscious", "live conscious", "essential elements", "tru alchemy"]
     if any(ic in vendor_lower for ic in intercompany):
         issues.append(f"Intercompany invoice - route to Chelsea")
     
@@ -316,6 +442,17 @@ def validate_invoice(invoice_data: dict) -> Tuple[bool, List[str]]:
     ref = (invoice_data.get("bill_reference") or "").lower()
     if "tbd" in ref or "placeholder" in ref:
         issues.append("TBD placeholder invoice")
+    
+    # QuickBooks duplicate check
+    if qb and qb_creds and not issues:  # Only check QB if no other issues
+        company = invoice_data.get("company", "Unknown")
+        vendor_name = invoice_data.get("vendor_name", "")
+        doc_number = invoice_data.get("bill_reference", "")
+        
+        if company != "Unknown" and doc_number:
+            if check_exists_in_qb(qb, qb_creds, company, vendor_name, doc_number):
+                issues.append(f"Already exists in QuickBooks ({company})")
+                invoice_data["already_in_qb"] = True
     
     invoice_data["validation_warnings"] = warnings
     invoice_data["validation_errors"] = issues
@@ -382,7 +519,7 @@ def send_alert(subject: str, message: str):
             logger.error(f"Alert failed: {e}")
 
 
-def process_bill(odoo: OdooClient, bill: dict) -> Optional[dict]:
+def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] = None, qb_creds: Optional[dict] = None) -> Optional[dict]:
     """Process single bill, validate, and return invoice data."""
     entry_id = bill.get("name", f"BILL-{bill['id']}")
     
@@ -495,10 +632,12 @@ def lambda_handler(event, context):
     
     processed = 0
     validation_failed = 0
+    already_in_qb = 0
     skipped = 0
     errors = 0
     
     try:
+        # Initialize Odoo
         creds = get_odoo_credentials()
         odoo = OdooClient(
             base_url=ODOO_API_URL,
@@ -510,24 +649,33 @@ def lambda_handler(event, context):
         if not odoo.authenticate():
             raise Exception("Odoo authentication failed")
         
+        # Initialize QB checker
+        qb = init_qb_checker()
+        qb_creds = get_qb_credentials() if qb else None
+        
+        # Get bills from Odoo
         bills = odoo.get_posted_vendor_bills(since_hours=lookback_hours)
         logger.info(f"Found {len(bills)} posted vendor bills")
         
         for bill in bills:
             try:
-                invoice_data = process_bill(odoo, bill)
+                invoice_data = process_bill(odoo, bill, qb, qb_creds)
                 
                 if not invoice_data:
                     skipped += 1
                     continue
                 
-                # Validate
-                is_valid, issues = validate_invoice(invoice_data)
+                # Validate (including QB duplicate check)
+                is_valid, issues = validate_invoice(invoice_data, qb, qb_creds)
                 
                 if is_valid:
                     save_to_dynamodb(invoice_data, STATUS_READY_FOR_APPROVAL)
                     processed += 1
                     logger.info(f"✓ {invoice_data['entry_id']} ready for approval")
+                elif invoice_data.get("already_in_qb"):
+                    save_to_dynamodb(invoice_data, STATUS_ALREADY_IN_QB)
+                    already_in_qb += 1
+                    logger.info(f"⊘ {invoice_data['entry_id']} already in QuickBooks")
                 else:
                     save_to_dynamodb(invoice_data, STATUS_VALIDATION_FAILED)
                     validation_failed += 1
@@ -537,7 +685,7 @@ def lambda_handler(event, context):
                 errors += 1
                 logger.error(f"Error processing {bill.get('name')}: {e}")
         
-        summary = f"Ready: {processed}, ValidationFailed: {validation_failed}, Skipped: {skipped}, Errors: {errors}"
+        summary = f"Ready: {processed}, ValidationFailed: {validation_failed}, AlreadyInQB: {already_in_qb}, Skipped: {skipped}, Errors: {errors}"
         logger.info(summary)
         
         if errors > 0:
@@ -549,6 +697,7 @@ def lambda_handler(event, context):
                 "message": summary,
                 "ready_for_approval": processed,
                 "validation_failed": validation_failed,
+                "already_in_qb": already_in_qb,
                 "skipped": skipped,
                 "errors": errors
             })
