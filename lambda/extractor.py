@@ -79,37 +79,207 @@ COMPANY_MAP = {
 }
 
 
-def map_odoo_to_qb_account(account_code: str, account_name: str, product_name: str = "") -> str:
-    """Map Odoo account codes to QuickBooks categories."""
+def map_odoo_to_qb_account(account_code: str, account_name: str, product_name: str = "", company: str = "Unknown") -> str:
+    """Map Odoo account codes to QuickBooks categories based on company."""
     combined = f"{account_name} {product_name}".lower()
     
-    # Stock/Inventory accounts
+    # Strip decimals from account codes (52120.2 → 52120)
+    if account_code:
+        account_code = account_code.split(".")[0]
+    
+    # Stock/Inventory accounts (same for all brands)
     if account_code and account_code.startswith("13210"):
         return "Inventory Asset:DTC Inventory"
     
-    # Stock Interim Account (from your test data)
     if "stock interim" in combined:
         return "Inventory Asset:DTC Inventory"
     
-    # Landed costs (51130)
-    if account_code == "51130" or "landed" in combined:
-        if any(t in combined for t in ["freight", "shipping", "inbound"]):
-            return "PRODUCTION COSTS - ALWAYS USE:Freight In"
-        if any(t in combined for t in ["pallet", "skid"]):
-            return "PRODUCTION COSTS - ALWAYS USE:Freight In"
-        if any(t in combined for t in ["die", "plate"]):
-            return "PRODUCTION COSTS - ALWAYS USE:Packaging & Labeling"
-        if "mock" in combined:
-            return "PRODUCTION COSTS - ALWAYS USE:Packaging & Labeling"
-        if "rework" in combined:
-            return "PRODUCTION COSTS - ALWAYS USE:Packaging & Labeling"
+    # Company-specific mappings based on QB chart of accounts
+    if company == "1MD":
+        return map_1md_account(account_code, combined)
+    elif company == "LiveConscious":
+        return map_liveconscious_account(account_code, combined)
+    elif company == "EssentialElements":
+        return map_essentialelements_account(account_code, combined)
+    elif company == "TruAlchemy":
+        return map_trualchemy_account(account_code, combined)
+    else:
+        # Default fallback mapping
+        return map_default_account(account_code, combined)
+
+
+def map_1md_account(account_code: str, combined: str) -> str:
+    """Digital Med LLC specific mappings."""
+    
+    # Freight/Shipping
+    if account_code == "52130" or any(term in combined for term in ["freight", "shipping", "inbound"]):
         return "PRODUCTION COSTS - ALWAYS USE:Freight In"
     
-    if "inventory" in combined:
+    # 3PL Services
+    if account_code == "52120" or any(term in combined for term in ["3pl fulfillment", "fulfillment services"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    # Outbound Postage
+    if account_code == "52140" or any(term in combined for term in ["outbound postage", "delivery costs"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    # Returns/RTS
+    if account_code == "52150" or "rts" in combined or "returns postage" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs for RTS - Always Use"
+    
+    # Not Freight (packaging, pallets, dies, rework)
+    if (account_code == "52120" and "not freight" in combined) or \
+       any(term in combined for term in ["pallet", "skid", "die", "plate", "mock", "rework", "packaging"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Packaging & Labeling - Always Use"
+    
+    # Quality Testing
+    if account_code == "52500" or "quality" in combined or "lab test" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Manufacturing - Always Use"
+    
+    # Amazon Distribution/FBA
+    if account_code == "52220" or ("amazon" in combined and any(term in combined for term in ["distribution", "3pl"])):
+        return "PRODUCTION COSTS - ALWAYS USE:FBA Manufacturing - Always Use"
+    
+    # Amazon FBA Fees
+    if account_code == "52270" or ("amazon" in combined and "fba fees" in combined):
+        return "COS Marketplace:Amazon FBA Selling Fees"
+    
+    # Walmart Distribution
+    if account_code == "52320" or ("walmart" in combined and "distribution" in combined):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    # Scrap Loss
+    if account_code == "52180" or "scrap" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Scraps"
+    
+    # Default to inventory for unknown
+    return "Inventory Asset:DTC Inventory"
+
+
+def map_liveconscious_account(account_code: str, combined: str) -> str:
+    """New Momentum Media (LiveConscious) specific mappings."""
+    
+    if account_code == "52130" or any(term in combined for term in ["freight", "shipping", "inbound"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Freight In"
+    
+    if account_code == "52120" or any(term in combined for term in ["3pl fulfillment", "fulfillment services"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    if account_code == "52140" or any(term in combined for term in ["outbound postage", "delivery costs"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    if account_code == "52150" or "rts" in combined or "returns postage" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs for RTS - Always Use"
+    
+    if (account_code == "52120" and "not freight" in combined) or \
+       any(term in combined for term in ["pallet", "skid", "die", "plate", "mock", "rework", "packaging"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Packaging & Labeling - Always Use"
+    
+    if account_code == "52500" or "quality" in combined or "lab test" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Quality Testing"
+    
+    # Amazon FBA specific
+    if account_code == "52220" or ("amazon" in combined and any(term in combined for term in ["distribution", "3pl"])):
+        return "PRODUCTION COSTS - ALWAYS USE:FBA Manufacturing - Always Use"
+    
+    if account_code == "52270" or ("amazon" in combined and "fba fees" in combined):
+        return "COS Marketplace:Amazon FBA Selling Fees"
+    
+    # Walmart specific
+    if account_code == "52320" or ("walmart" in combined and "distribution" in combined):
+        return "PRODUCTION COSTS - ALWAYS USE:WMT Shipping Costs - Always Use"
+    
+    if account_code == "52180" or "scrap" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Scraps"
+    
+    return "Inventory Asset:DTC Inventory"
+
+
+def map_essentialelements_account(account_code: str, combined: str) -> str:
+    """Infinite Focus (EssentialElements) specific mappings."""
+    
+    if account_code == "52130" or any(term in combined for term in ["freight", "shipping", "inbound"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Freight In"
+    
+    if account_code == "52120" or any(term in combined for term in ["3pl fulfillment", "fulfillment services"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    if account_code == "52140" or any(term in combined for term in ["outbound postage", "delivery costs"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    if account_code == "52150" or "rts" in combined or "returns postage" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs for RTS - Always Use"
+    
+    if (account_code == "52120" and "not freight" in combined) or \
+       any(term in combined for term in ["pallet", "skid", "die", "plate", "mock", "rework", "packaging"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Packaging & Labeling - Always Use"
+    
+    if account_code == "52500" or "quality" in combined or "lab test" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Quality Testing"
+    
+    if account_code == "52220" or ("amazon" in combined and any(term in combined for term in ["distribution", "3pl"])):
+        return "PRODUCTION COSTS - ALWAYS USE:FBA Manufacturing - Always Use"
+    
+    if account_code == "52270" or ("amazon" in combined and "fba fees" in combined):
+        return "COS Marketplace:Amazon FBA Selling Fees"
+    
+    if account_code == "52320" or ("walmart" in combined and "distribution" in combined):
+        return "PRODUCTION COSTS - ALWAYS USE:WMT Shipping Costs - Always Use"
+    
+    if account_code == "52180" or "scrap" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Scraps"
+    
+    return "Inventory Asset:DTC Inventory"
+
+
+def map_trualchemy_account(account_code: str, combined: str) -> str:
+    """Direct Insight LLC (TruAlchemy) specific mappings."""
+    
+    if account_code == "52130" or any(term in combined for term in ["freight", "shipping", "inbound"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Freight In"
+    
+    if account_code == "52120" or any(term in combined for term in ["3pl fulfillment", "fulfillment services"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    if account_code == "52140" or any(term in combined for term in ["outbound postage", "delivery costs"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    if account_code == "52150" or "rts" in combined or "returns postage" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs for RTS - Always Use"
+    
+    if (account_code == "52120" and "not freight" in combined) or \
+       any(term in combined for term in ["pallet", "skid", "die", "plate", "mock", "rework", "packaging"]):
+        return "PRODUCTION COSTS - ALWAYS USE:Packaging & Labeling - Always Use"
+    
+    if account_code == "52500" or "quality" in combined or "lab test" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Manufacturing - Always Use"
+    
+    if account_code == "52220" or ("amazon" in combined and any(term in combined for term in ["distribution", "3pl"])):
+        return "PRODUCTION COSTS - ALWAYS USE:FBA Manufacturing - Always Use"
+    
+    if account_code == "52270" or ("amazon" in combined and "fba fees" in combined):
+        return "COS Marketplace:Amazon FBA Selling Fees"
+    
+    if account_code == "52320" or ("walmart" in combined and "distribution" in combined):
+        return "PRODUCTION COSTS - ALWAYS USE:Delivery Costs - Always Use"
+    
+    if account_code == "52180" or "scrap" in combined:
+        return "PRODUCTION COSTS - ALWAYS USE:Scraps"
+    
+    return "Inventory Asset:DTC Inventory"
+
+
+def map_default_account(account_code: str, combined: str) -> str:
+    """Default mapping for unknown companies."""
+    
+    # Basic freight/inventory logic
+    if "freight" in combined or account_code == "52130":
+        return "PRODUCTION COSTS:Freight In"
+    
+    if "inventory" in combined or account_code and account_code.startswith("1321"):
         return "Inventory Asset:DTC Inventory"
-    if "freight" in combined:
-        return "PRODUCTION COSTS - ALWAYS USE:Freight In"
     
+    # Default to inventory
     return "Inventory Asset:DTC Inventory"
 
 
@@ -203,17 +373,17 @@ class OdooClient:
         domain = [
             ("move_type", "=", "in_invoice"),
             ("state", "=", "posted"),
-            ("create_date", ">=", since),
+            ("write_date", ">=", since),  # Use write_date to catch re-confirmed invoices
         ]
         
         if TEST_START_DATE:
-            domain.append(("create_date", ">=", TEST_START_DATE))
+            domain.append(("write_date", ">=", TEST_START_DATE))
         
         fields = [
             "id", "name", "ref", "partner_id", "company_id",
             "invoice_date", "invoice_date_due", "date",
             "invoice_payment_term_id", "amount_total", "amount_untaxed",
-            "currency_id", "invoice_line_ids", "invoice_origin", "create_date"
+            "currency_id", "invoice_line_ids", "invoice_origin", "create_date", "write_date"
         ]
         
         return self.search_read("account.move", domain, fields)
@@ -383,13 +553,31 @@ def check_exists_in_qb(qb: QuickBooksChecker, qb_creds: dict, company: str, vend
     return qb.bill_exists(realm_id, access_token, vendor_name, doc_number)
 
 
-def is_duplicate(entry_id: str) -> bool:
-    """Check if entry exists in DynamoDB."""
+def is_duplicate(entry_id: str, write_date: str = None) -> bool:
+    """
+    Check if entry exists in DynamoDB.
+    If write_date is provided, also check if the stored version is older.
+    Returns False if the invoice was updated (allowing reprocessing).
+    """
     if not table:
         return False
     try:
         resp = table.get_item(Key={"entry_id": entry_id})
-        return "Item" in resp
+        if "Item" not in resp:
+            return False
+        
+        item = resp["Item"]
+        
+        # If we have a write_date and the item was rejected/failed, check if it was updated
+        if write_date and item.get("status") in ["REJECTED", "VALIDATION_FAILED"]:
+            stored_write_date = item.get("write_date", "")
+            if write_date > stored_write_date:
+                # Invoice was updated in Odoo - delete old record and allow reprocessing
+                table.delete_item(Key={"entry_id": entry_id})
+                logger.info(f"Invoice {entry_id} was updated in Odoo (write_date: {write_date} > {stored_write_date}), reprocessing")
+                return False
+        
+        return True
     except ClientError:
         return False
 
@@ -522,9 +710,10 @@ def send_alert(subject: str, message: str):
 def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] = None, qb_creds: Optional[dict] = None) -> Optional[dict]:
     """Process single bill, validate, and return invoice data."""
     entry_id = bill.get("name", f"BILL-{bill['id']}")
+    write_date = bill.get("write_date", "")
     
-    # Duplicate check
-    if is_duplicate(entry_id):
+    # Duplicate check (with write_date for reprocessing rejected invoices)
+    if is_duplicate(entry_id, write_date):
         logger.info(f"Skipping {entry_id} - already exists")
         return None
     
@@ -564,7 +753,8 @@ def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] =
             account_name = line["account_id"][1]
             parts = account_name.split(" ", 1)
             if parts and parts[0].replace(".", "").isdigit():
-                account_code = parts[0]
+                # Strip decimal portion (52120.2 → 52120)
+                account_code = parts[0].split(".")[0]
         
         product_name = ""
         if line.get("product_id") and isinstance(line["product_id"], list):
@@ -579,7 +769,7 @@ def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] =
             "quantity": float(line.get("quantity", 0)),
             "unit_price": float(line.get("price_unit", 0)),
             "subtotal": float(subtotal),
-            "qb_category": map_odoo_to_qb_account(account_code, account_name, product_name),
+            "qb_category": map_odoo_to_qb_account(account_code, account_name, product_name, company),
         })
     
     # PDF
@@ -619,6 +809,7 @@ def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] =
         "line_items": processed_lines,
         "pdf_s3_key": pdf_s3_key,
         "pdf_filename": pdf_filename,
+        "write_date": write_date,
     }
     
     return invoice_data

@@ -1,6 +1,6 @@
 ## Odoo → QuickBooks Integration (Serverless)
 
-Automated, approval-based pipeline that extracts vendor bills from Odoo, routes them to Slack for finance approval, and posts approved invoices to QuickBooks. It uses four AWS Lambda functions orchestrated by EventBridge (schedule), DynamoDB Streams, a Lambda Function URL (for Slack interactivity), and SQS. DynamoDB tracks state, Secrets Manager stores credentials, and CloudWatch/SNS provide observability.
+Automated, approval-based pipeline that extracts vendor bills from Odoo, routes them to Slack for finance approval, and posts approved invoices to QuickBooks. It uses four AWS Lambda functions orchestrated by EventBridge (schedule), DynamoDB Streams, an API Gateway HTTP API (for Slack interactivity), and SQS. DynamoDB tracks state, Secrets Manager stores credentials, and CloudWatch/SNS provide observability.
 
 ![QuickbooksWorkFlow](./Workflow.png)
 
@@ -11,15 +11,17 @@ Automated, approval-based pipeline that extracts vendor bills from Odoo, routes 
   - Reads Odoo credentials from AWS Secrets Manager
   - Fetches posted vendor bills and validates data
   - Checks QuickBooks for existing bills to avoid duplicates
+  - Uses Odoo `write_date` to reprocess bills updated after prior rejection
   - Uploads PDFs to S3 under `pending/<company>/<entry_id>.pdf`
   - Writes records to DynamoDB with `status=READY_FOR_APPROVAL`
   - Publishes failure alerts to SNS
 - Slack Notifier (Lambda):
   - Triggered by DynamoDB Streams on new `READY_FOR_APPROVAL` records
-  - Builds Slack Block Kit message with invoice details + Approve/Reject buttons
+  - Builds Slack Block Kit message with invoice details and line items → QB account mapping
+  - Shows Approve/Reject buttons; for intercompany invoices shows an Acknowledge button (no auto-post)
   - Posts to a configured Slack channel and records the Slack message timestamp
 - Approval Handler (API Gateway HTTP API → Lambda):
-  - Target for Slack interactive button clicks (Approve/Reject/View PDF) via API Gateway URL
+  - Target for Slack interactive button clicks (Approve/Reject/Acknowledge/View PDF) via API Gateway URL
   - Verifies Slack signing secret, updates DynamoDB status
   - On Approve: enqueues invoice to SQS for posting
 - QuickBooks Poster (Lambda):
@@ -84,7 +86,8 @@ Secrets payloads are generated from these variables and stored in Secrets Manage
 - Extractor (`extractor.lambda_handler`)
   - Env: `ENVIRONMENT`, `ODOO_API_URL`, `ODOO_SECRET_ARN`, `QB_SECRET_ARN`, `DYNAMODB_TABLE`, `S3_BUCKET`, `SNS_ALERT_TOPIC`, `QB_USE_SANDBOX`, `SKIP_QB_CHECK`
 - Notifier (`notifier.lambda_handler`)
-  - Env: `ENVIRONMENT`, `SLACK_SECRET_ARN`, `SLACK_CHANNEL_ID`, `DYNAMODB_TABLE`, `S3_BUCKET`, `APPROVAL_URL`
+  - Env: `SLACK_SECRET_ARN`, `DYNAMODB_TABLE`, `S3_BUCKET` (optionally `SLACK_CHANNEL_ID` via env/secret)
+  - Notes: includes line items with mapped QB accounts; intercompany uses Acknowledge (no auto-post)
 - Approval Handler (`approval_handler.lambda_handler`) via API Gateway
   - Env: `ENVIRONMENT`, `DYNAMODB_TABLE`, `SQS_QUEUE_URL`, `SLACK_SECRET_ARN`
 - Poster (`poster.lambda_handler`)
@@ -200,8 +203,9 @@ Terraform outputs include:
   - Extractor writes PDFs to `s3://<bucket>/pending/<company>/<entry_id>.pdf`
   - Extractor writes `READY_FOR_APPROVAL` items to DynamoDB
   - Extractor may also write `VALIDATION_FAILED` or `ALREADY_IN_QB` based on checks
-  - Notifier (DDB Stream) sends Slack Approve/Reject
-  - Approval Handler updates status and enqueues SQS
+  - Notifier (DDB Stream) sends Slack Approve/Reject (or Acknowledge for intercompany)
+  - Intercompany: Approval Handler sets `ACKNOWLEDGED` (no SQS enqueue)
+  - Approval Handler updates status and enqueues SQS on Approve
   - Poster consumes SQS, posts to QuickBooks, updates DynamoDB
 - Alerts and Health:
   - SNS email on alarms

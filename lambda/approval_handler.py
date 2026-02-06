@@ -31,6 +31,7 @@ SLACK_SECRET_ARN = os.environ.get("SLACK_SECRET_ARN", "")
 # Status constants
 STATUS_APPROVED = "APPROVED"
 STATUS_REJECTED = "REJECTED"
+STATUS_ACKNOWLEDGED = "ACKNOWLEDGED"  # For intercompany invoices (manual QB entry)
 
 # Rejection reasons dropdown
 REJECT_REASONS = [
@@ -188,6 +189,9 @@ def update_slack_message(response_url: str, entry_id: str, action: str, user: st
     elif action == "reject":
         text = f"❌ *Rejected* by <@{user}>"
         color = "#dc3545"
+    elif action == "acknowledge":
+        text = f"📋 *Acknowledged* by <@{user}> (Manual QB entry required)"
+        color = "#17a2b8"
     elif action == "already_processed":
         text = f"⚠️ *Already processed* (clicked by <@{user}>)"
         color = "#ffc107"
@@ -352,6 +356,15 @@ def handle_approval(payload: dict, bot_token: str) -> dict:
                 return {"statusCode": 500, "body": "Failed to enqueue"}
         else:
             # Already processed - update Slack message anyway
+            update_slack_message(response_url, entry_id, "already_processed", user_id)
+            return {"statusCode": 200, "body": "Already processed"}
+    
+    # Handle intercompany acknowledgment (no QB posting)
+    if action_id == "acknowledge_intercompany":
+        if update_invoice_status(entry_id, STATUS_ACKNOWLEDGED, username, "Intercompany - manual QB entry"):
+            update_slack_message(response_url, entry_id, "acknowledge", user_id)
+            return {"statusCode": 200, "body": ""}
+        else:
             update_slack_message(response_url, entry_id, "already_processed", user_id)
             return {"statusCode": 200, "body": "Already processed"}
     
