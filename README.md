@@ -32,6 +32,7 @@ Automated, approval-based pipeline that extracts vendor bills from Odoo, routes 
   - CloudWatch Logs per Lambda
   - CloudWatch Alarms for DLQ message visibility
   - SNS topic for email alerts
+  - Optional Datadog APM/tracing when enabled
 
 ---
 
@@ -76,6 +77,12 @@ This configuration provisions:
   - `qb_client_id`, `qb_client_secret` (sensitive)
   - `qb_use_sandbox` (bool, default `false`)
   - `qb_credentials` (map of company → `{ realm_id, refresh_token }`)
+- Datadog (optional):
+  - `datadog_enabled` (bool, default `false`)
+  - `datadog_api_key` (sensitive, default empty)
+  - `app_version` (string, default `1.0.0`)
+- Slack notifications (optional):
+  - `rejection_notify_users` (comma-separated Slack user IDs to tag on rejections)
 
 Secrets payloads are generated from these variables and stored in Secrets Manager by Terraform.
 
@@ -85,11 +92,16 @@ Secrets payloads are generated from these variables and stored in Secrets Manage
 
 - Extractor (`extractor.lambda_handler`)
   - Env: `ENVIRONMENT`, `ODOO_API_URL`, `ODOO_SECRET_ARN`, `QB_SECRET_ARN`, `DYNAMODB_TABLE`, `S3_BUCKET`, `SNS_ALERT_TOPIC`, `QB_USE_SANDBOX`, `SKIP_QB_CHECK`
+  - Notes:
+    - Uses Odoo `write_date` to reprocess updated bills that were previously rejected
+    - Computes QB `DocNumber` consistently with poster
+    - Uploads PDF after validation (or when flagged `ALREADY_IN_QB`) to reduce S3 churn
+    - Persists refreshed QB refresh tokens back to Secrets Manager when they rotate
 - Notifier (`notifier.lambda_handler`)
   - Env: `SLACK_SECRET_ARN`, `DYNAMODB_TABLE`, `S3_BUCKET` (optionally `SLACK_CHANNEL_ID` via env/secret)
   - Notes: includes line items with mapped QB accounts; intercompany uses Acknowledge (no auto-post)
 - Approval Handler (`approval_handler.lambda_handler`) via API Gateway
-  - Env: `ENVIRONMENT`, `DYNAMODB_TABLE`, `SQS_QUEUE_URL`, `SLACK_SECRET_ARN`
+  - Env: `ENVIRONMENT`, `DYNAMODB_TABLE`, `SQS_QUEUE_URL`, `SLACK_SECRET_ARN`, `ODOO_SECRET_ARN`, `ODOO_API_URL`, `REJECTION_NOTIFY_USERS`, `SLACK_CHANNEL_ID`
 - Poster (`poster.lambda_handler`)
   - Env: `ENVIRONMENT`, `QB_SECRET_ARN`, `DYNAMODB_TABLE`, `S3_BUCKET`, `SNS_ALERT_TOPIC`
 
@@ -156,6 +168,14 @@ qb_credentials = {
     refresh_token = "********"
   }
 }
+
+# Datadog (optional)
+datadog_enabled = false
+datadog_api_key = ""
+app_version     = "1.0.0"
+
+# Tag these Slack users on rejections (optional)
+rejection_notify_users = "U12345,U67890"
 ```
 
 Terraform will create/update the Secrets Manager values from these variables.
@@ -210,6 +230,7 @@ Terraform outputs include:
 - Alerts and Health:
   - SNS email on alarms
   - CloudWatch Alarms on DLQ `ApproximateNumberOfMessagesVisible > 0`
+  - If Datadog enabled: traces/metrics tagged with `component:*` and `pipeline:odoo-qb`
 
 ### Manual Invocation (ad-hoc)
 

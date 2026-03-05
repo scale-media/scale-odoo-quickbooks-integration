@@ -3,6 +3,10 @@ Lambda 4: Approval Handler
 
 Lambda Function URL / API Gateway that handles Slack interactive button clicks.
 Updates DynamoDB status and enqueues approved invoices to SQS.
+
+On rejection:
+  1. Stores rejected_by + rejection_reason in DynamoDB
+  2. Posts rejection notice in Slack tagging supply team contacts (Joe/Karina)
 """
 
 import os
@@ -28,6 +32,11 @@ DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "")
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
 SLACK_SECRET_ARN = os.environ.get("SLACK_SECRET_ARN", "")
 
+# Slack user IDs to tag on rejections (Joe and Karina)
+# Update these with actual Slack user IDs from your workspace
+REJECTION_NOTIFY_USERS = os.environ.get("REJECTION_NOTIFY_USERS", "").split(",")
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
+
 # Status constants
 STATUS_APPROVED = "APPROVED"
 STATUS_REJECTED = "REJECTED"
@@ -37,7 +46,7 @@ STATUS_ACKNOWLEDGED = "ACKNOWLEDGED"  # For intercompany invoices (manual QB ent
 REJECT_REASONS = [
     "Wrong GL account",
     "Missing PDF",
-    "Intercompany - route to Chelsea",
+    "Intercompany - Must Post Manually",
     "Duplicate invoice",
     "Amount mismatch",
     "Wrong vendor",
@@ -60,7 +69,7 @@ def get_slack_config() -> dict:
             "bot_token": os.environ.get("SLACK_BOT_TOKEN", ""),
             "signing_secret": os.environ.get("SLACK_SIGNING_SECRET", ""),
         }
-    
+
     try:
         resp = secrets_client.get_secret_value(SecretId=SLACK_SECRET_ARN)
         return json.loads(resp["SecretString"])
@@ -72,23 +81,23 @@ def get_slack_config() -> dict:
 def verify_slack_signature(headers: dict, body: str, signing_secret: str) -> bool:
     """
     Verify request is from Slack using signing secret.
-    
+
     IMPORTANT: body must be the decoded string (not base64), as Slack signs the actual payload.
     """
-    
+
     # Skip verification if no signing secret (dev mode)
     if not signing_secret:
         logger.warning("Slack signing secret not configured - skipping verification")
         return True
-    
+
     # Lambda Function URL / API Gateway headers are lowercase
     timestamp = headers.get("x-slack-request-timestamp", "")
     signature = headers.get("x-slack-signature", "")
-    
+
     if not timestamp or not signature:
         logger.error(f"Missing Slack signature headers. Headers present: {list(headers.keys())}")
         return False
-    
+
     # Check timestamp is recent (within 5 minutes)
     try:
         if abs(time.time() - int(timestamp)) > 300:
@@ -97,7 +106,7 @@ def verify_slack_signature(headers: dict, body: str, signing_secret: str) -> boo
     except ValueError:
         logger.error(f"Invalid timestamp: {timestamp}")
         return False
-    
+
     # Compute expected signature
     sig_basestring = f"v0:{timestamp}:{body}"
     expected = "v0=" + hmac.new(
@@ -105,38 +114,66 @@ def verify_slack_signature(headers: dict, body: str, signing_secret: str) -> boo
         sig_basestring.encode(),
         hashlib.sha256
     ).hexdigest()
-    
+
     if not hmac.compare_digest(expected, signature):
         logger.error("Slack signature mismatch")
         logger.debug(f"Expected: {expected[:20]}...")
         logger.debug(f"Received: {signature[:20]}...")
         return False
-    
+
     return True
+
+
+def get_invoice(entry_id: str) -> dict:
+    """Fetch full invoice record from DynamoDB."""
+    if not table:
+        return {}
+    try:
+        resp = table.get_item(Key={"entry_id": entry_id})
+        return resp.get("Item", {})
+    except ClientError as e:
+        logger.error(f"DynamoDB get failed for {entry_id}: {e}")
+        return {}
 
 
 def update_invoice_status(entry_id: str, status: str, user: str, reason: str = None) -> bool:
     """
     Update invoice status in DynamoDB with conditional check.
     Only updates if current status is READY_FOR_APPROVAL (prevents double-approvals).
+
+    For rejections, stores rejected_by and rejection_reason.
+    For approvals, stores approved_by and approved_at.
     """
     if not table:
         logger.warning(f"[NO DB] Would update {entry_id} to {status}")
         return True
-    
+
     try:
-        update_expr = "SET #status = :status, approved_by = :user, approved_at = :ts"
-        expr_values = {
-            ":status": status,
-            ":user": user,
-            ":ts": datetime.utcnow().isoformat(),
-            ":expected_status": "READY_FOR_APPROVAL"
-        }
-        
-        if reason:
-            update_expr += ", rejection_reason = :reason"
-            expr_values[":reason"] = reason
-        
+        now = datetime.utcnow().isoformat()
+
+        if status == STATUS_REJECTED:
+            update_expr = "SET #status = :status, rejected_by = :user, rejected_at = :ts"
+            expr_values = {
+                ":status": status,
+                ":user": user,
+                ":ts": now,
+                ":expected_status": "READY_FOR_APPROVAL"
+            }
+            if reason:
+                update_expr += ", rejection_reason = :reason"
+                expr_values[":reason"] = reason
+        else:
+            update_expr = "SET #status = :status, approved_by = :user, approved_at = :ts"
+            expr_values = {
+                ":status": status,
+                ":user": user,
+                ":ts": now,
+                ":expected_status": "READY_FOR_APPROVAL"
+            }
+            if reason:
+                update_expr += ", rejection_reason = :reason"
+                expr_values[":reason"] = reason
+
         table.update_item(
             Key={"entry_id": entry_id},
             UpdateExpression=update_expr,
@@ -144,10 +181,10 @@ def update_invoice_status(entry_id: str, status: str, user: str, reason: str = N
             ExpressionAttributeValues=expr_values,
             ConditionExpression="#status = :expected_status"
         )
-        
+
         logger.info(f"Updated {entry_id} to {status} by {user}")
         return True
-        
+
     except ClientError as e:
         if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
             logger.warning(f"Invoice {entry_id} already processed (not in READY_FOR_APPROVAL state)")
@@ -161,7 +198,7 @@ def enqueue_for_posting(entry_id: str) -> bool:
     if not SQS_QUEUE_URL:
         logger.warning(f"[NO SQS] Would enqueue {entry_id}")
         return True
-    
+
     try:
         params = {
             "QueueUrl": SQS_QUEUE_URL,
@@ -170,19 +207,81 @@ def enqueue_for_posting(entry_id: str) -> bool:
         # Only add MessageGroupId for FIFO queues
         if ".fifo" in SQS_QUEUE_URL:
             params["MessageGroupId"] = "invoices"
-        
+
         sqs_client.send_message(**params)
         logger.info(f"Enqueued {entry_id} for posting")
         return True
-        
+
     except ClientError as e:
         logger.error(f"SQS enqueue failed: {e}")
         return False
 
 
+def notify_slack_rejection(entry_id: str, reason: str, rejected_by: str,
+                           vendor_name: str, amount: str, bot_token: str):
+    """
+    Post a rejection notification in the Slack channel tagging Joe/Karina.
+    """
+    if not bot_token or not SLACK_CHANNEL_ID:
+        logger.warning("Slack bot_token or channel_id not configured for rejection notification")
+        return
+
+    # Build user mentions
+    mentions = " ".join(f"<@{uid.strip()}>" for uid in REJECTION_NOTIFY_USERS if uid.strip())
+    if not mentions:
+        mentions = "Supply team"
+
+    text = (
+        f"🔴 *Invoice Rejected*\n"
+        f"*Invoice:* `{entry_id}`\n"
+        f"*Vendor:* {vendor_name}\n"
+        f"*Amount:* {amount}\n"
+        f"*Rejected by:* <@{rejected_by}>\n"
+        f"*Reason:* {reason}\n\n"
+        f"{mentions} — please review and update this bill in Odoo. "
+        f"Once corrected and re-confirmed, it will re-enter the approval queue automatically."
+    )
+
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "channel": SLACK_CHANNEL_ID,
+                "text": text,
+                "unfurl_links": False,
+            },
+            timeout=5
+        )
+        result = resp.json()
+        if not result.get("ok"):
+            logger.error(f"Slack rejection notification failed: {result.get('error')}")
+        else:
+            logger.info(f"Sent Slack rejection notification for {entry_id}")
+    except Exception as e:
+        logger.error(f"Slack rejection notification error: {e}")
+
+
+def handle_rejection_notification(entry_id: str, reason: str, rejected_by: str, bot_token: str):
+    """
+    After a rejection is recorded in DynamoDB, notify the supply team via Slack.
+    Tags the configured users (Joe/Karina) so they know to review the bill in Odoo.
+    """
+    # Fetch invoice record for display fields
+    invoice = get_invoice(entry_id)
+    vendor_name = invoice.get("vendor_name", "Unknown")
+    amount = invoice.get("amount_total", 0)
+    amount_str = f"${float(amount):,.2f}" if amount else "N/A"
+
+    notify_slack_rejection(entry_id, reason, rejected_by, vendor_name, amount_str, bot_token)
+
+
 def update_slack_message(response_url: str, entry_id: str, action: str, user: str):
     """Update the original Slack message to show approval/rejection."""
-    
+
     if action == "approve":
         text = f"✅ *Approved* by <@{user}>"
         color = "#36a64f"
@@ -198,7 +297,7 @@ def update_slack_message(response_url: str, entry_id: str, action: str, user: st
     else:
         text = f"Unknown action: {action}"
         color = "#6c757d"
-    
+
     # Replace original message with simpler confirmation
     payload = {
         "replace_original": True,
@@ -218,7 +317,7 @@ def update_slack_message(response_url: str, entry_id: str, action: str, user: st
             }
         ]
     }
-    
+
     try:
         resp = requests.post(response_url, json=payload, timeout=5)
         if resp.status_code != 200:
@@ -229,7 +328,7 @@ def update_slack_message(response_url: str, entry_id: str, action: str, user: st
 
 def update_slack_message_with_reason(response_url: str, entry_id: str, user: str, reason: str):
     """Update Slack message showing rejection with reason."""
-    
+
     payload = {
         "replace_original": True,
         "blocks": [
@@ -249,7 +348,7 @@ def update_slack_message_with_reason(response_url: str, entry_id: str, user: str
             }
         ]
     }
-    
+
     try:
         resp = requests.post(response_url, json=payload, timeout=5)
         if resp.status_code != 200:
@@ -260,7 +359,7 @@ def update_slack_message_with_reason(response_url: str, entry_id: str, user: str
 
 def open_reject_modal(trigger_id: str, entry_id: str, response_url: str, bot_token: str):
     """Open modal for rejection reason selection."""
-    
+
     modal = {
         "type": "modal",
         "callback_id": "reject_modal",
@@ -304,7 +403,7 @@ def open_reject_modal(trigger_id: str, entry_id: str, response_url: str, bot_tok
             }
         ]
     }
-    
+
     try:
         resp = requests.post(
             "https://slack.com/api/views.open",
@@ -324,28 +423,28 @@ def open_reject_modal(trigger_id: str, entry_id: str, response_url: str, bot_tok
 
 def handle_approval(payload: dict, bot_token: str) -> dict:
     """Handle approve/reject button clicks."""
-    
+
     actions = payload.get("actions", [])
     if not actions:
         return {"statusCode": 400, "body": "No actions"}
-    
+
     action = actions[0]
     action_id = action.get("action_id", "")
     entry_id = action.get("value", "")
-    
+
     user_info = payload.get("user", {})
     user_id = user_info.get("id", "unknown")
     username = user_info.get("username", "unknown")
-    
+
     response_url = payload.get("response_url", "")
     trigger_id = payload.get("trigger_id", "")
-    
+
     logger.info(f"Action: {action_id} on {entry_id} by {username}")
-    
+
     # Handle view PDF - no action needed, Slack opens URL
     if action_id == "view_pdf":
         return {"statusCode": 200, "body": ""}
-    
+
     # Handle approval
     if action_id == "approve_invoice":
         if update_invoice_status(entry_id, STATUS_APPROVED, username):
@@ -358,7 +457,7 @@ def handle_approval(payload: dict, bot_token: str) -> dict:
             # Already processed - update Slack message anyway
             update_slack_message(response_url, entry_id, "already_processed", user_id)
             return {"statusCode": 200, "body": "Already processed"}
-    
+
     # Handle intercompany acknowledgment (no QB posting)
     if action_id == "acknowledge_intercompany":
         if update_invoice_status(entry_id, STATUS_ACKNOWLEDGED, username, "Intercompany - manual QB entry"):
@@ -367,70 +466,74 @@ def handle_approval(payload: dict, bot_token: str) -> dict:
         else:
             update_slack_message(response_url, entry_id, "already_processed", user_id)
             return {"statusCode": 200, "body": "Already processed"}
-    
+
     # Handle quick rejection (no reason)
     if action_id == "quick_reject_invoice":
-        if update_invoice_status(entry_id, STATUS_REJECTED, username, "Quick rejected via Slack"):
+        reason = "Quick rejected via Slack"
+        if update_invoice_status(entry_id, STATUS_REJECTED, username, reason):
             update_slack_message(response_url, entry_id, "reject", user_id)
+            handle_rejection_notification(entry_id, reason, user_id, bot_token)
             return {"statusCode": 200, "body": ""}
         else:
             update_slack_message(response_url, entry_id, "already_processed", user_id)
             return {"statusCode": 200, "body": "Already processed"}
-    
+
     # Handle rejection with reason - open modal
     if action_id == "reject_invoice":
         open_reject_modal(trigger_id, entry_id, response_url, bot_token)
         return {"statusCode": 200, "body": ""}
-    
+
     return {"statusCode": 400, "body": f"Unknown action: {action_id}"}
 
 
-def handle_modal_submit(payload: dict) -> dict:
+def handle_modal_submit(payload: dict, bot_token: str) -> dict:
     """Handle modal submission (rejection with reason)."""
-    
+
     user_info = payload.get("user", {})
     user_id = user_info.get("id", "unknown")
     username = user_info.get("username", "unknown")
-    
+
     # Get entry_id and response_url from private_metadata
     private_metadata = payload.get("view", {}).get("private_metadata", "{}")
     try:
         metadata = json.loads(private_metadata)
         entry_id = metadata.get("entry_id", "")
         response_url = metadata.get("response_url", "")
-    except:
+    except Exception:
         logger.error("Failed to parse modal metadata")
         return {"statusCode": 400, "body": "Invalid metadata"}
-    
+
     # Get selected reason from modal values
     values = payload.get("view", {}).get("state", {}).get("values", {})
-    
+
     reason = ""
     notes = ""
-    
+
     reason_block = values.get("reason_block", {})
     if reason_block:
         reason_data = reason_block.get("reject_reason", {})
         selected = reason_data.get("selected_option", {})
         reason = selected.get("value", "Unknown reason")
-    
+
     notes_block = values.get("notes_block", {})
     if notes_block:
         notes_data = notes_block.get("reject_notes", {})
         notes = notes_data.get("value", "")
-    
+
     # Combine reason and notes
     full_reason = reason
     if notes:
         full_reason = f"{reason}: {notes}"
-    
+
     logger.info(f"Modal submit: {entry_id} rejected by {username} - {full_reason}")
-    
+
     # Update status with reason
     if update_invoice_status(entry_id, STATUS_REJECTED, username, full_reason):
         # Update the original Slack message
         if response_url:
             update_slack_message_with_reason(response_url, entry_id, user_id, full_reason)
+        # Notify supply team via Slack
+        handle_rejection_notification(entry_id, full_reason, user_id, bot_token)
         return {"statusCode": 200, "body": ""}
     else:
         # Already processed
@@ -438,20 +541,19 @@ def handle_modal_submit(payload: dict) -> dict:
             update_slack_message(response_url, entry_id, "already_processed", user_id)
         return {"statusCode": 200, "body": "Already processed"}
 
-
 def lambda_handler(event, context):
     """Handle API Gateway / Lambda Function URL requests from Slack."""
-    
+
     logger.info(f"Received request: {event.get('requestContext', {}).get('http', {}).get('method')}")
-    
+
     # Get Slack config for verification
     config = get_slack_config()
-    
+
     # Get body - decode if base64 encoded
     body = event.get("body", "")
     if event.get("isBase64Encoded"):
         body = base64.b64decode(body).decode("utf-8")
-    
+
     # Verify request is from Slack (using decoded body)
     headers = event.get("headers", {})
     if not verify_slack_signature(headers, body, config.get("signing_secret", "")):
@@ -460,7 +562,7 @@ def lambda_handler(event, context):
             "statusCode": 401,
             "body": "Invalid signature"
         }
-    
+
     # Parse the payload (body is already decoded)
     try:
         parsed = parse_qs(body)
@@ -469,25 +571,26 @@ def lambda_handler(event, context):
     except Exception as e:
         logger.error(f"Failed to parse payload: {e}")
         return {"statusCode": 400, "body": "Invalid payload"}
-    
+
     # Handle different interaction types
     interaction_type = payload.get("type", "")
-    
+    bot_token = config.get("bot_token", "")
+
     if interaction_type == "block_actions":
-        return handle_approval(payload, config.get("bot_token", ""))
-    
+        return handle_approval(payload, bot_token)
+
     if interaction_type == "view_submission":
         # Modal submitted
         callback_id = payload.get("view", {}).get("callback_id", "")
         if callback_id == "reject_modal":
-            return handle_modal_submit(payload)
-    
+            return handle_modal_submit(payload, bot_token)
+
     # Handle URL verification (for setup)
     if interaction_type == "url_verification":
         return {
             "statusCode": 200,
             "body": payload.get("challenge", "")
         }
-    
+
     logger.warning(f"Unknown interaction type: {interaction_type}")
     return {"statusCode": 200, "body": ""}

@@ -79,6 +79,7 @@ def build_slack_message(invoice: dict) -> dict:
     amount = invoice.get("amount_total", 0)
     bill_ref = invoice.get("bill_reference", "N/A")
     bill_date = invoice.get("bill_date", "N/A")
+    accounting_date = invoice.get("accounting_date", "N/A") 
     due_date = invoice.get("due_date", "N/A")
     po_number = invoice.get("po_number", "")
     payment_terms = invoice.get("payment_terms", "Net30")
@@ -105,8 +106,9 @@ def build_slack_message(invoice: dict) -> dict:
                 {"type": "mrkdwn", "text": f"*Bill #:*\n{bill_ref}"},
                 {"type": "mrkdwn", "text": f"*Amount:*\n{format_currency(amount)}"},
                 {"type": "mrkdwn", "text": f"*PO:*\n{po_number or 'N/A'}"},
-                {"type": "mrkdwn", "text": f"*Date:*\n{bill_date}"},
-                {"type": "mrkdwn", "text": f"*Due:*\n{due_date or 'N/A'}"},
+                {"type": "mrkdwn", "text": f"*Invoice Date:*\n{bill_date}"},
+                {"type": "mrkdwn", "text": f"*Accounting Date:*\n{accounting_date}"},
+                {"type": "mrkdwn", "text": f"*Due Date:*\n{due_date or 'N/A'}"},
                 {"type": "mrkdwn", "text": f"*Terms:*\n{payment_terms}"},
             ]
         },
@@ -142,7 +144,7 @@ def build_slack_message(invoice: dict) -> dict:
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": "⚠️ *INTERCOMPANY INVOICE* - Will NOT auto-post to QuickBooks. Chelsea must enter manually as journal entry."
+                "text": "⚠️ *INTERCOMPANY INVOICE* - Will NOT auto-post to QuickBooks. Must enter manually as journal entry."
             }
         })
     

@@ -25,6 +25,15 @@ import boto3
 import requests
 from botocore.exceptions import ClientError
 
+try:
+    from dd_helpers import trace_span, emit_metric, tag_current_span
+except ImportError:
+    from contextlib import contextmanager
+    @contextmanager
+    def trace_span(*a, **kw): yield type('', (), {'set_tag': lambda *a: None, 'set_metric': lambda *a: None})()
+    def emit_metric(*a, **kw): pass
+    def tag_current_span(*a, **kw): pass
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -57,26 +66,41 @@ STATUS_VALIDATION_FAILED = "VALIDATION_FAILED"
 STATUS_DUPLICATE = "DUPLICATE"
 STATUS_ALREADY_IN_QB = "ALREADY_IN_QB"
 
-# Company mapping
-COMPANY_MAP = {
-    "Digital Med, LLC dba 1MD Nutrition": "1MD",
-    "Digital Med LLC": "1MD",
-    "1MD Nutrition": "1MD",
-    "New Momentum Media Inc. dba LiveConscious": "LiveConscious",
-    "New Momentum Media Inc. dba Live Conscious": "LiveConscious",
-    "New Momentum Media Inc": "LiveConscious",
-    "LiveConscious": "LiveConscious",
-    "Live Conscious": "LiveConscious",
-    "Infinite Focus, Inc. dba Essential Elements": "EssentialElements",
-    "Infinite Focus, Inc": "EssentialElements",
-    "Essential Elements": "EssentialElements",
-    "True Form Health, Inc. dba Tru Alchemy": "TruAlchemy",
-    "True Form Health, Inc": "TruAlchemy",
-    "Tru Alchemy": "TruAlchemy",
-    "Direct Insight LLC": "TruAlchemy",
-    "Beauty Science Group, Inc. dba Hair La Vie": "HairLaVie",
-    "Scale Media, Inc.": "ScaleMedia",
-}
+# Company mapping function (case-insensitive)
+def map_company_name(odoo_company_name: str) -> str:
+    """Map Odoo company name to short name (case-insensitive)."""
+    if not odoo_company_name:
+        return "Unknown"
+    
+    company_lower = odoo_company_name.lower()
+    
+    # Digital Med / 1MD
+    if ("digital med" in company_lower and "1md" in company_lower) or \
+       ("digital med" in company_lower and "nutrition" in company_lower) or \
+       "1md nutrition" in company_lower:
+        return "1MD"
+    
+    # New Momentum Media / LiveConscious
+    elif ("new momentum" in company_lower and ("liveconscious" in company_lower or "live conscious" in company_lower)) or \
+         "liveconscious" in company_lower or "live conscious" in company_lower:
+        return "LiveConscious"
+    
+    # Infinite Focus / Essential Elements  
+    elif ("infinite focus" in company_lower and "essential" in company_lower) or \
+         "essential elements" in company_lower:
+        return "EssentialElements"
+    
+    # True Form Health / Tru Alchemy / Direct Insight
+    elif ("true form health" in company_lower and "tru alchemy" in company_lower) or \
+         "tru alchemy" in company_lower or "direct insight" in company_lower:
+        return "TruAlchemy"
+    
+    # Scale Media
+    elif "scale media" in company_lower:
+        return "ScaleMedia"
+    
+    else:
+        return "Unknown"
 
 
 def map_odoo_to_qb_account(account_code: str, account_name: str, product_name: str = "", company: str = "Unknown") -> str:
@@ -425,9 +449,16 @@ class QuickBooksChecker:
         self.use_sandbox = use_sandbox
         self.base_url = "https://sandbox-quickbooks.api.intuit.com" if use_sandbox else "https://quickbooks.api.intuit.com"
         self.access_tokens: Dict[str, str] = {}  # realm_id -> access_token
+        self.updated_refresh_tokens: Dict[str, str] = {}  # realm_id -> new refresh_token
     
     def get_access_token(self, refresh_token: str, realm_id: str) -> Optional[str]:
-        """Get access token for a specific realm."""
+        """Get access token for a specific realm.
+        
+        QB refresh tokens are single-use. Every successful refresh returns a new
+        refresh_token that must be persisted, or the next run will fail with 400.
+        New tokens are collected in self.updated_refresh_tokens and flushed to
+        Secrets Manager at the end of the run via persist_refresh_tokens().
+        """
         if realm_id in self.access_tokens:
             return self.access_tokens[realm_id]
         
@@ -441,9 +472,18 @@ class QuickBooksChecker:
             )
             
             if resp.status_code == 200:
-                token = resp.json().get("access_token")
-                self.access_tokens[realm_id] = token
-                return token
+                data = resp.json()
+                access_token = data.get("access_token")
+                new_refresh_token = data.get("refresh_token")
+                
+                self.access_tokens[realm_id] = access_token
+                
+                # Capture the new refresh token for persistence
+                if new_refresh_token and new_refresh_token != refresh_token:
+                    self.updated_refresh_tokens[realm_id] = new_refresh_token
+                    logger.info(f"Captured new refresh token for realm {realm_id}")
+                
+                return access_token
             else:
                 logger.warning(f"QB token refresh failed for realm {realm_id}: {resp.status_code}")
                 return None
@@ -451,14 +491,19 @@ class QuickBooksChecker:
             logger.warning(f"QB token refresh error for realm {realm_id}: {e}")
             return None
     
-    def bill_exists(self, realm_id: str, access_token: str, vendor_name: str, doc_number: str) -> bool:
-        """Check if bill exists in QuickBooks."""
+    def bill_exists(self, realm_id: str, access_token: str, vendor_name: str, doc_number: str) -> tuple[bool, dict]:
+        """
+        Check if bill exists in QuickBooks.
+        Returns (exists, details) where details contains match info for audit.
+        """
         if not doc_number:
-            return False
+            return False, {}
         
         # Escape single quotes in doc_number
         safe_doc = doc_number.replace("'", "\\'")
-        query = f"SELECT Id FROM Bill WHERE DocNumber = '{safe_doc}'"
+        
+        # Query by DocNumber only (VendorRef.Name is not queryable in QB API)
+        query = f"SELECT Id, DocNumber, VendorRef, TotalAmt, TxnDate FROM Bill WHERE DocNumber = '{safe_doc}'"
         
         try:
             resp = requests.get(
@@ -474,13 +519,61 @@ class QuickBooksChecker:
             if resp.status_code == 200:
                 data = resp.json()
                 bills = data.get("QueryResponse", {}).get("Bill", [])
-                return len(bills) > 0
+                
+                if bills:
+                    # Check ALL bills with matching DocNumber (not just first one)
+                    for bill in bills:
+                        qb_vendor_name = bill.get("VendorRef", {}).get("name", "")
+                        
+                        # Normalize vendor names for comparison
+                        def normalize_vendor(name: str) -> str:
+                            name = (name or "").strip()
+                            return "".join(c.lower() for c in name if c.isalnum())
+                        
+                        if normalize_vendor(qb_vendor_name) == normalize_vendor(vendor_name):
+                            # Real match - same vendor and DocNumber
+                            logger.info(f"QB duplicate found: Bill ID {bill.get('Id')} for {vendor_name} doc {doc_number} in realm {realm_id}")
+                            
+                            return True, {
+                                "qb_bill_id": bill.get("Id"),
+                                "qb_doc_number": bill.get("DocNumber"),
+                                "qb_vendor": qb_vendor_name,
+                                "qb_realm_id": realm_id,
+                                "qb_query": query
+                            }
+                    
+                    # DocNumber exists but no vendor match - store warning info
+                    qb_vendors = [bill.get("VendorRef", {}).get("name", "") for bill in bills]
+                    logger.warning(f"DocNumber {doc_number} exists in QB but vendor differs: QB vendors={qb_vendors} vs Odoo vendor='{vendor_name}'")
+                    
+                    return False, {
+                        "docnumber_exists": True,
+                        "qb_vendors": qb_vendors,
+                        "odoo_vendor": vendor_name,
+                        "qb_bills": [bill.get("Id") for bill in bills],
+                        "qb_amounts": [float(bill.get("TotalAmt", 0)) for bill in bills],
+                        "qb_dates": [bill.get("TxnDate", "") for bill in bills],
+                        "warning": f"DocNumber exists but vendor differs: QB={qb_vendors} vs Odoo='{vendor_name}'"
+                    }
+                else:
+                    logger.debug(f"No QB bill found with DocNumber {doc_number} in realm {realm_id}")
+                    return False, {}
             else:
-                logger.warning(f"QB query failed: {resp.status_code}")
-                return False
+                logger.error(f"QB query failed: {resp.status_code} - {resp.text[:200]}")
+                raise Exception(f"QB API returned {resp.status_code}: {resp.text[:100]}")
+                
         except Exception as e:
-            logger.warning(f"QB query error: {e}")
-            return False
+            logger.error(f"QB query error for {vendor_name} doc {doc_number}: {e}")
+            raise
+
+
+def compute_qb_doc_number(bill_reference: str, entry_id: str) -> str:
+    """
+    Compute QB DocNumber using same logic as poster to ensure consistency.
+    Poster uses: (bill_reference or entry_id).replace("/", "-")[:21]
+    """
+    doc_number = (bill_reference or entry_id).replace("/", "-")
+    return doc_number[:21]  # QB DocNumber limit is 21 characters
 
 
 def get_odoo_credentials() -> dict:
@@ -531,26 +624,78 @@ def init_qb_checker() -> Optional[QuickBooksChecker]:
     )
 
 
-def check_exists_in_qb(qb: QuickBooksChecker, qb_creds: dict, company: str, vendor_name: str, doc_number: str) -> bool:
-    """Check if bill already exists in QuickBooks for the given company."""
-    if not qb or not qb_creds:
-        return False
+def persist_refresh_tokens(qb: QuickBooksChecker):
+    """
+    Write any new refresh tokens back to Secrets Manager.
     
+    QB refresh tokens are single-use: each token exchange returns a new one.
+    If we don't persist the new token, the next Lambda invocation will fail
+    because the old token has already been consumed.
+    
+    This does a single read-modify-write at the end of the run to minimize
+    Secrets Manager API calls.
+    """
+    if not qb or not qb.updated_refresh_tokens:
+        return
+    
+    if not QB_SECRET_ARN:
+        logger.warning("No QB_SECRET_ARN - cannot persist updated refresh tokens")
+        return
+    
+    try:
+        # Read current secret
+        resp = secrets_client.get_secret_value(SecretId=QB_SECRET_ARN)
+        secret = json.loads(resp["SecretString"])
+        companies = secret.get("companies", {})
+        
+        updated = []
+        for company_name, company_creds in companies.items():
+            realm_id = company_creds.get("realm_id", "")
+            if realm_id in qb.updated_refresh_tokens:
+                company_creds["refresh_token"] = qb.updated_refresh_tokens[realm_id]
+                updated.append(company_name)
+        
+        if updated:
+            secret["companies"] = companies
+            secrets_client.put_secret_value(
+                SecretId=QB_SECRET_ARN,
+                SecretString=json.dumps(secret)
+            )
+            logger.info(f"Persisted new refresh tokens for: {', '.join(updated)}")
+        
+    except Exception as e:
+        # Log but don't raise - the extractor run itself succeeded
+        logger.error(f"Failed to persist refresh tokens: {e}. Tokens may be stale on next run.")
+
+
+def check_exists_in_qb(qb: QuickBooksChecker, qb_creds: dict, company: str, vendor_name: str, doc_number: str) -> tuple[bool, dict, str]:
+    """
+    Check if bill already exists in QuickBooks for the given company.
+    Returns (exists, qb_details, error_message).
+    If QB check fails, error_message will contain the reason.
+    """
+    # Use same credential structure as poster: "companies" not "credentials"
     companies = qb_creds.get("companies", {})
     company_creds = companies.get(company)
     
     if not company_creds or not company_creds.get("realm_id") or not company_creds.get("refresh_token"):
-        logger.debug(f"No QB credentials for company {company}")
-        return False
+        return False, {}, f"No QB credentials for company {company}"
     
     realm_id = company_creds["realm_id"]
     refresh_token = company_creds["refresh_token"]
     
-    access_token = qb.get_access_token(refresh_token, realm_id)
-    if not access_token:
-        return False
-    
-    return qb.bill_exists(realm_id, access_token, vendor_name, doc_number)
+    try:
+        access_token = qb.get_access_token(refresh_token, realm_id)
+        if not access_token:
+            return False, {}, f"Failed to get QB access token for {company}"
+        
+        exists, details = qb.bill_exists(realm_id, access_token, vendor_name, doc_number)
+        return exists, details, ""
+        
+    except Exception as e:
+        error_msg = f"QB duplicate check failed for {company}: {str(e)}"
+        logger.error(error_msg)
+        return False, {}, error_msg
 
 
 def is_duplicate(entry_id: str, write_date: str = None) -> bool:
@@ -616,8 +761,8 @@ def validate_invoice(invoice_data: dict, qb: Optional[QuickBooksChecker] = None,
     if invoice_data.get("company") == "Unknown":
         warnings.append(f"Unknown company: {invoice_data.get('company_name')}")
     
-    # PDF check
-    if not invoice_data.get("pdf_s3_key"):
+    # PDF check (pdf_filename is set when Odoo has an attachment; actual upload happens after validation)
+    if not invoice_data.get("pdf_filename"):
         warnings.append("No PDF attachment")
     
     # Intercompany check
@@ -635,12 +780,77 @@ def validate_invoice(invoice_data: dict, qb: Optional[QuickBooksChecker] = None,
     if qb and qb_creds and not issues:  # Only check QB if no other issues
         company = invoice_data.get("company", "Unknown")
         vendor_name = invoice_data.get("vendor_name", "")
-        doc_number = invoice_data.get("bill_reference", "")
+        bill_reference = invoice_data.get("bill_reference", "")
+        entry_id = invoice_data.get("entry_id", "")
         
-        if company != "Unknown" and doc_number:
-            if check_exists_in_qb(qb, qb_creds, company, vendor_name, doc_number):
+        # Use same DocNumber format as poster for consistency
+        qb_doc_number = compute_qb_doc_number(bill_reference, entry_id)
+        invoice_data["qb_doc_number"] = qb_doc_number  # Store for audit
+        
+        if company != "Unknown" and qb_doc_number:
+            exists, qb_details, error_msg = check_exists_in_qb(qb, qb_creds, company, vendor_name, qb_doc_number)
+            
+            if error_msg:
+                # QB check failed - this is a validation failure, not a warning
+                issues.append(f"QB duplicate check failed: {error_msg}")
+                logger.error(f"QB check failed for {entry_id}: {error_msg}")
+            elif exists:
+                # Found duplicate in QB - store all details for audit
                 issues.append(f"Already exists in QuickBooks ({company})")
                 invoice_data["already_in_qb"] = True
+                invoice_data["qb_duplicate_details"] = qb_details  # Store QB bill ID and details
+                logger.warning(f"QB duplicate: {entry_id} already exists as QB Bill ID {qb_details.get('qb_bill_id')}")
+            else:
+                # Check if DocNumber existed but vendor differed (best-effort match info)
+                if qb_details.get("docnumber_exists"):
+                    # Fuzzy duplicate check: if amount and date also match, likely same bill
+                    odoo_amount = invoice_data.get("amount_total", 0)
+                    odoo_date = invoice_data.get("bill_date", "")
+                    qb_amounts = qb_details.get("qb_amounts", [])
+                    qb_dates = qb_details.get("qb_dates", [])
+                    
+                    is_fuzzy_dup = False
+                    for qb_amt, qb_dt in zip(qb_amounts, qb_dates):
+                        amount_match = abs(odoo_amount - qb_amt) <= 0.02
+                        
+                        # Compare dates with ±1 day tolerance (handles timezone shifts, datetime vs date, etc.)
+                        date_match = False
+                        if odoo_date and qb_dt:
+                            try:
+                                odoo_d = datetime.strptime(str(odoo_date)[:10], "%Y-%m-%d").date()
+                                qb_d = datetime.strptime(str(qb_dt)[:10], "%Y-%m-%d").date()
+                                date_match = abs((odoo_d - qb_d).days) <= 1
+                            except (ValueError, TypeError):
+                                date_match = False
+                        
+                        if amount_match and date_match:
+                            is_fuzzy_dup = True
+                            logger.warning(
+                                f"Fuzzy duplicate: {entry_id} matches QB bill "
+                                f"(amount ${qb_amt:.2f} ≈ ${odoo_amount:.2f}, date {qb_dt} = {odoo_date}) "
+                                f"despite vendor mismatch"
+                            )
+                            break
+                    
+                    if is_fuzzy_dup:
+                        issues.append(
+                            f"Likely duplicate in QB: DocNumber + amount + date match "
+                            f"despite vendor name difference ({qb_details.get('odoo_vendor')} vs {qb_details.get('qb_vendors')})"
+                        )
+                        invoice_data["already_in_qb"] = True
+                        invoice_data["qb_duplicate_details"] = qb_details
+                    else:
+                        warnings.append(qb_details.get("warning", "DocNumber exists in QB but vendor differs"))
+                        invoice_data["qb_vendor_mismatch"] = qb_details
+                        logger.info(f"QB check passed for {entry_id}, DocNumber exists with different vendor but amount/date differ")
+                else:
+                    # Clean pass - no duplicate found
+                    logger.info(f"QB duplicate check passed for {entry_id} in {company}")
+        elif company == "Unknown":
+            # Optional: Make Unknown company a hard failure instead of warning
+            # Uncomment this line to fail on Unknown companies:
+            # issues.append(f"Unknown company - cannot determine QB realm: {invoice_data.get('company_name')}")
+            pass
     
     invoice_data["validation_warnings"] = warnings
     invoice_data["validation_errors"] = issues
@@ -707,8 +917,8 @@ def send_alert(subject: str, message: str):
             logger.error(f"Alert failed: {e}")
 
 
-def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] = None, qb_creds: Optional[dict] = None) -> Optional[dict]:
-    """Process single bill, validate, and return invoice data."""
+def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] = None, qb_creds: Optional[dict] = None) -> Optional[tuple]:
+    """Process single bill, validate, and return (invoice_data, pdf_data) or None."""
     entry_id = bill.get("name", f"BILL-{bill['id']}")
     write_date = bill.get("write_date", "")
     
@@ -721,7 +931,7 @@ def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] =
     company_name = ""
     if bill.get("company_id"):
         company_name = bill["company_id"][1] if isinstance(bill["company_id"], list) else str(bill["company_id"])
-    company = COMPANY_MAP.get(company_name, "Unknown")
+    company = map_company_name(company_name)
     
     # Vendor
     vendor_name = ""
@@ -772,23 +982,32 @@ def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] =
             "qb_category": map_odoo_to_qb_account(account_code, account_name, product_name, company),
         })
     
-    # PDF
+    # PDF - fetch from Odoo but don't upload yet (upload after validation)
     attachment = odoo.get_attachment("account.move", bill["id"])
-    pdf_s3_key = None
+    pdf_data = None
     pdf_filename = None
     
     if attachment and attachment.get("datas"):
         try:
             pdf_data = base64.b64decode(attachment["datas"])
-            pdf_s3_key = upload_pdf_to_s3(pdf_data, company, entry_id)
             pdf_filename = attachment.get("name")
         except Exception as e:
-            logger.error(f"PDF processing failed for {entry_id}: {e}")
+            logger.error(f"PDF decode failed for {entry_id}: {e}")
     
     # PO reference
     po_number = bill.get("invoice_origin") or bill.get("ref", "")
     
-    # Build invoice data
+    # Use invoice line items as authoritative total (not move header).
+    invoice_lines_total = round(sum(l["subtotal"] for l in processed_lines), 2)
+    move_header_total = float(bill.get("amount_total", 0))
+    
+    if abs(invoice_lines_total - move_header_total) > 0.02:
+        logger.warning(
+            f"{entry_id}: Invoice lines total (${invoice_lines_total:.2f}) differs from "
+            f"move header (${move_header_total:.2f}). Using invoice lines total per policy."
+        )
+    
+    # Build invoice data (purely JSON-serializable, no raw bytes)
     invoice_data = {
         "entry_id": entry_id,
         "odoo_id": bill["id"],
@@ -803,16 +1022,17 @@ def process_bill(odoo: OdooClient, bill: dict, qb: Optional[QuickBooksChecker] =
         "payment_terms": payment_terms,
         "payment_terms_days": get_payment_terms_days(payment_terms),
         "po_number": po_number,
-        "amount_total": float(bill.get("amount_total", 0)),
-        "amount_untaxed": float(bill.get("amount_untaxed", 0)),
+        "amount_total": invoice_lines_total,
+        "amount_untaxed": invoice_lines_total,  # Same since no tax on vendor bills
+        "odoo_move_total": move_header_total,  # Keep original for audit trail
         "currency": bill.get("currency_id", [None, "USD"])[1] if isinstance(bill.get("currency_id"), list) else "USD",
         "line_items": processed_lines,
-        "pdf_s3_key": pdf_s3_key,
+        "pdf_s3_key": None,
         "pdf_filename": pdf_filename,
         "write_date": write_date,
     }
     
-    return invoice_data
+    return invoice_data, pdf_data
 
 
 def lambda_handler(event, context):
@@ -844,20 +1064,43 @@ def lambda_handler(event, context):
         qb = init_qb_checker()
         qb_creds = get_qb_credentials() if qb else None
         
+        # Token keepalive: refresh every company's token on every run.
+        # QB refresh tokens are single-use and expire after 100 days of inactivity.
+        if qb and qb_creds:
+            companies = qb_creds.get("companies", {})
+            for comp_name, comp_creds in companies.items():
+                realm_id = comp_creds.get("realm_id", "")
+                refresh_token = comp_creds.get("refresh_token", "")
+                if realm_id and refresh_token:
+                    token = qb.get_access_token(refresh_token, realm_id)
+                    if token:
+                        logger.info(f"Token keepalive OK for {comp_name}")
+                    else:
+                        logger.warning(f"Token keepalive FAILED for {comp_name} - re-auth needed")
+        
         # Get bills from Odoo
         bills = odoo.get_posted_vendor_bills(since_hours=lookback_hours)
         logger.info(f"Found {len(bills)} posted vendor bills")
         
         for bill in bills:
             try:
-                invoice_data = process_bill(odoo, bill, qb, qb_creds)
+                result = process_bill(odoo, bill, qb, qb_creds)
                 
-                if not invoice_data:
+                if not result:
                     skipped += 1
                     continue
                 
+                invoice_data, pdf_data = result
+                
                 # Validate (including QB duplicate check)
                 is_valid, issues = validate_invoice(invoice_data, qb, qb_creds)
+                
+                # Upload PDF to S3 for valid invoices and QB duplicates (for audit trail)
+                if (is_valid or invoice_data.get("already_in_qb")) and pdf_data:
+                    pdf_s3_key = upload_pdf_to_s3(
+                        pdf_data, invoice_data["company"], invoice_data["entry_id"]
+                    )
+                    invoice_data["pdf_s3_key"] = pdf_s3_key
                 
                 if is_valid:
                     save_to_dynamodb(invoice_data, STATUS_READY_FOR_APPROVAL)
@@ -878,6 +1121,18 @@ def lambda_handler(event, context):
         
         summary = f"Ready: {processed}, ValidationFailed: {validation_failed}, AlreadyInQB: {already_in_qb}, Skipped: {skipped}, Errors: {errors}"
         logger.info(summary)
+        
+        # Persist any new QB refresh tokens back to Secrets Manager
+        # This MUST happen before the Lambda exits or next run's tokens will be stale
+        persist_refresh_tokens(qb)
+        
+        # Datadog custom metrics
+        emit_metric("odoo_qb.extractor.bills_found", len(bills))
+        emit_metric("odoo_qb.extractor.ready", processed)
+        emit_metric("odoo_qb.extractor.validation_failed", validation_failed)
+        emit_metric("odoo_qb.extractor.already_in_qb", already_in_qb)
+        emit_metric("odoo_qb.extractor.errors", errors)
+        tag_current_span({"bills.total": len(bills), "bills.ready": processed, "bills.errors": errors})
         
         if errors > 0:
             send_alert(f"[{ENVIRONMENT}] Extractor: {errors} errors", summary)

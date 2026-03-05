@@ -132,6 +132,46 @@ variable "qb_use_sandbox" {
   default     = false
 }
 
+# Datadog Configuration
+
+variable "datadog_api_key" {
+  description = "Datadog API key for APM"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "datadog_enabled" {
+  description = "Enable Datadog APM for all Lambdas"
+  type        = bool
+  default     = false
+}
+
+variable "app_version" {
+  description = "Application version for Datadog versioning"
+  type        = string
+  default     = "1.0.0"
+}
+
+variable "rejection_notify_users" {
+  description = "Comma-separated Slack user IDs to tag on invoice rejections (Joe, Karina)"
+  type        = string
+  default     = ""
+}
+
+locals {
+  datadog_layer = "arn:aws:lambda:${var.aws_region}:464622532012:layer:Datadog-Python312:99"
+
+  dd_env_base = var.datadog_enabled ? {
+    DD_API_KEY                 = var.datadog_api_key
+    DD_SITE                    = "datadoghq.com"
+    DD_ENV                     = var.environment
+    DD_VERSION                 = var.app_version
+    DD_TRACE_ENABLED           = "true"
+    DD_SERVERLESS_LOGS_ENABLED = "true"
+  } : {}
+}
+
 # Data Sources
 
 data "aws_caller_identity" "current" {}
@@ -299,7 +339,7 @@ resource "aws_secretsmanager_secret_version" "qb_credentials" {
     client_id     = var.qb_client_id
     client_secret = var.qb_client_secret
     use_sandbox   = var.qb_use_sandbox
-    credentials   = var.qb_credentials
+    companies   = var.qb_credentials
   })
 }
 
@@ -357,8 +397,11 @@ resource "aws_iam_role_policy" "extractor_policy" {
       },
       {
         Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = aws_secretsmanager_secret.odoo_credentials.arn
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
+        Resource = [
+          aws_secretsmanager_secret.odoo_credentials.arn,
+          aws_secretsmanager_secret.qb_credentials.arn
+        ]
       },
       {
         Effect   = "Allow"
@@ -458,7 +501,10 @@ resource "aws_iam_role_policy" "approval_policy" {
       {
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
-        Resource = aws_secretsmanager_secret.slack_config.arn
+        Resource = [
+          aws_secretsmanager_secret.slack_config.arn,
+          aws_secretsmanager_secret.odoo_credentials.arn
+        ]
       }
     ]
   })
@@ -526,48 +572,69 @@ resource "aws_lambda_function" "extractor" {
   filename         = "${path.module}/lambda/extractor.zip"
   function_name    = "odoo-extractor-${var.environment}"
   role             = aws_iam_role.extractor_role.arn
-  handler          = "extractor.lambda_handler"
+  handler          = var.datadog_enabled ? "datadog_lambda.handler.handler" : "extractor.lambda_handler"
   source_code_hash = filebase64sha256("${path.module}/lambda/extractor.zip")
   runtime          = "python3.12"
   timeout          = 300
   memory_size      = 512
-  
+
+  layers = var.datadog_enabled ? [local.datadog_layer] : []
+
   environment {
-    variables = {
-      ENVIRONMENT     = var.environment
-      ODOO_API_URL    = var.odoo_api_url
-      ODOO_SECRET_ARN = aws_secretsmanager_secret.odoo_credentials.arn
-      DYNAMODB_TABLE  = aws_dynamodb_table.invoices.name
-      S3_BUCKET       = aws_s3_bucket.invoice_pdfs.id
-      SNS_ALERT_TOPIC = aws_sns_topic.alerts.arn
-    }
+    variables = merge(
+      {
+        ENVIRONMENT     = var.environment
+        ODOO_API_URL    = var.odoo_api_url
+        ODOO_SECRET_ARN = aws_secretsmanager_secret.odoo_credentials.arn
+        DYNAMODB_TABLE  = aws_dynamodb_table.invoices.name
+        S3_BUCKET       = aws_s3_bucket.invoice_pdfs.id
+        QB_SECRET_ARN   = aws_secretsmanager_secret.qb_credentials.arn
+        SNS_ALERT_TOPIC = aws_sns_topic.alerts.arn
+      },
+      local.dd_env_base,
+      var.datadog_enabled ? {
+        DD_SERVICE        = "odoo-qb-extractor"
+        DD_LAMBDA_HANDLER = "extractor.lambda_handler"
+        DD_TAGS           = "component:extractor,pipeline:odoo-qb"
+      } : {}
+    )
   }
-  
+
   dead_letter_config {
     target_arn = aws_sqs_queue.extractor_dlq.arn
   }
 }
 
-# Lambda 3: Slack Notifier
+# Lambda 2: Slack Notifier
 resource "aws_lambda_function" "notifier" {
   filename         = "${path.module}/lambda/notifier.zip"
   function_name    = "odoo-notifier-${var.environment}"
   role             = aws_iam_role.notifier_role.arn
-  handler          = "notifier.lambda_handler"
+  handler          = var.datadog_enabled ? "datadog_lambda.handler.handler" : "notifier.lambda_handler"
   source_code_hash = filebase64sha256("${path.module}/lambda/notifier.zip")
   runtime          = "python3.12"
   timeout          = 30
   memory_size      = 256
-  
+
+  layers = var.datadog_enabled ? [local.datadog_layer] : []
+
   environment {
-    variables = {
-      ENVIRONMENT      = var.environment
-      SLACK_SECRET_ARN = aws_secretsmanager_secret.slack_config.arn
-      SLACK_CHANNEL_ID = var.slack_channel_id
-      DYNAMODB_TABLE   = aws_dynamodb_table.invoices.name
-      S3_BUCKET        = aws_s3_bucket.invoice_pdfs.id
-      APPROVAL_URL     = aws_apigatewayv2_stage.approval.invoke_url  # Changed to API Gateway
-    }
+    variables = merge(
+      {
+        ENVIRONMENT      = var.environment
+        SLACK_SECRET_ARN = aws_secretsmanager_secret.slack_config.arn
+        SLACK_CHANNEL_ID = var.slack_channel_id
+        DYNAMODB_TABLE   = aws_dynamodb_table.invoices.name
+        S3_BUCKET        = aws_s3_bucket.invoice_pdfs.id
+        APPROVAL_URL     = aws_apigatewayv2_stage.approval.invoke_url
+      },
+      local.dd_env_base,
+      var.datadog_enabled ? {
+        DD_SERVICE        = "odoo-qb-notifier"
+        DD_LAMBDA_HANDLER = "notifier.lambda_handler"
+        DD_TAGS           = "component:notifier,pipeline:odoo-qb"
+      } : {}
+    )
   }
 }
 
@@ -592,28 +659,42 @@ resource "aws_lambda_event_source_mapping" "notifier_stream" {
   }
 }
 
-# Lambda 4: Approval Handler
+# Lambda 3: Approval Handler
 resource "aws_lambda_function" "approval_handler" {
   filename         = "${path.module}/lambda/approval_handler.zip"
   function_name    = "odoo-approval-handler-${var.environment}"
   role             = aws_iam_role.approval_role.arn
-  handler          = "approval_handler.lambda_handler"
+  handler          = var.datadog_enabled ? "datadog_lambda.handler.handler" : "approval_handler.lambda_handler"
   source_code_hash = filebase64sha256("${path.module}/lambda/approval_handler.zip")
   runtime          = "python3.12"
   timeout          = 30
   memory_size      = 256
-  
+
+  layers = var.datadog_enabled ? [local.datadog_layer] : []
+
   environment {
-    variables = {
-      ENVIRONMENT      = var.environment
-      DYNAMODB_TABLE   = aws_dynamodb_table.invoices.name
-      SQS_QUEUE_URL    = aws_sqs_queue.approved_invoices.url
-      SLACK_SECRET_ARN = aws_secretsmanager_secret.slack_config.arn
-    }
+    variables = merge(
+      {
+        ENVIRONMENT      = var.environment
+        DYNAMODB_TABLE   = aws_dynamodb_table.invoices.name
+        SQS_QUEUE_URL    = aws_sqs_queue.approved_invoices.url
+        SLACK_SECRET_ARN = aws_secretsmanager_secret.slack_config.arn
+        ODOO_SECRET_ARN          = aws_secretsmanager_secret.odoo_credentials.arn
+        ODOO_API_URL             = var.odoo_api_url
+        REJECTION_NOTIFY_USERS   = var.rejection_notify_users
+        SLACK_CHANNEL_ID         = var.slack_channel_id
+      },
+      local.dd_env_base,
+      var.datadog_enabled ? {
+        DD_SERVICE        = "odoo-qb-approval"
+        DD_LAMBDA_HANDLER = "approval_handler.lambda_handler"
+        DD_TAGS           = "component:approval,pipeline:odoo-qb"
+      } : {}
+    )
   }
 }
 
-# API Gateway HTTP API for Approval Handler (replaces Function URL)
+# API Gateway HTTP API for Approval Handler 
 resource "aws_apigatewayv2_api" "approval" {
   name          = "odoo-slack-approval-${var.environment}"
   protocol_type = "HTTP"
@@ -666,25 +747,35 @@ resource "aws_cloudwatch_log_group" "api_gateway" {
   retention_in_days = 14
 }
 
-# Lambda 2: QB Poster (SQS triggered)
+# Lambda 4: QB Poster (SQS triggered)
 resource "aws_lambda_function" "poster" {
   filename         = "${path.module}/lambda/poster.zip"
   function_name    = "odoo-poster-${var.environment}"
   role             = aws_iam_role.poster_role.arn
-  handler          = "poster.lambda_handler"
+  handler          = var.datadog_enabled ? "datadog_lambda.handler.handler" : "poster.lambda_handler"
   source_code_hash = filebase64sha256("${path.module}/lambda/poster.zip")
   runtime          = "python3.12"
   timeout          = 300
   memory_size      = 256
-  
+
+  layers = var.datadog_enabled ? [local.datadog_layer] : []
+
   environment {
-    variables = {
-      ENVIRONMENT     = var.environment
-      QB_SECRET_ARN   = aws_secretsmanager_secret.qb_credentials.arn
-      DYNAMODB_TABLE  = aws_dynamodb_table.invoices.name
-      S3_BUCKET       = aws_s3_bucket.invoice_pdfs.id
-      SNS_ALERT_TOPIC = aws_sns_topic.alerts.arn
-    }
+    variables = merge(
+      {
+        ENVIRONMENT     = var.environment
+        QB_SECRET_ARN   = aws_secretsmanager_secret.qb_credentials.arn
+        DYNAMODB_TABLE  = aws_dynamodb_table.invoices.name
+        S3_BUCKET       = aws_s3_bucket.invoice_pdfs.id
+        SNS_ALERT_TOPIC = aws_sns_topic.alerts.arn
+      },
+      local.dd_env_base,
+      var.datadog_enabled ? {
+        DD_SERVICE        = "odoo-qb-poster"
+        DD_LAMBDA_HANDLER = "poster.lambda_handler"
+        DD_TAGS           = "component:poster,pipeline:odoo-qb"
+      } : {}
+    )
   }
 }
 
@@ -693,6 +784,7 @@ resource "aws_lambda_event_source_mapping" "poster_sqs" {
   event_source_arn = aws_sqs_queue.approved_invoices.arn
   function_name    = aws_lambda_function.poster.arn
   batch_size       = 1  # Process one at a time for QB rate limits
+  function_response_types            = ["ReportBatchItemFailures"]
 }
 
 # EventBridge - Scheduled Trigger

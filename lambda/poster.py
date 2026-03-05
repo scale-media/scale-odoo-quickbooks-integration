@@ -9,6 +9,7 @@ import os
 import json
 import logging
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Optional, Dict, Any
 
 import boto3
@@ -39,6 +40,9 @@ QB_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
 QB_SANDBOX_API_BASE = "https://sandbox-quickbooks.api.intuit.com/v3/company"
 QB_AUTH_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 
+# Lease timeout for POSTING claims (if Lambda dies mid-post)
+CLAIM_LEASE_MINUTES = 15
+
 # Use sandbox in dev
 USE_SANDBOX = os.environ.get("QB_USE_SANDBOX", "false").lower() == "true"
 
@@ -49,6 +53,15 @@ s3_client = boto3.client("s3")
 sns_client = boto3.client("sns")
 
 table = dynamodb.Table(DYNAMODB_TABLE) if DYNAMODB_TABLE else None
+
+
+def compute_qb_doc_number(bill_reference: str, entry_id: str) -> str:
+    """
+    Compute QB DocNumber - must match extractor logic exactly.
+    Always replaces slashes and truncates to 21 chars (QB limit).
+    """
+    doc_number = (bill_reference or entry_id).replace("/", "-")
+    return doc_number[:21]
 
 
 class QuickBooksClient:
@@ -94,7 +107,7 @@ class QuickBooksClient:
             if not self._refresh_access_token():
                 raise Exception("Failed to refresh QB token")
     
-    def _request(self, method: str, endpoint: str, data: dict = None) -> dict:
+    def _request(self, method: str, endpoint: str, data: dict = None, params: dict = None) -> dict:
         """Make authenticated QB API request."""
         self._ensure_token()
         
@@ -105,7 +118,7 @@ class QuickBooksClient:
             "Content-Type": "application/json",
         }
         
-        resp = requests.request(method, url, headers=headers, json=data, timeout=60)
+        resp = requests.request(method, url, headers=headers, json=data, params=params, timeout=60)
         
         if resp.status_code >= 400:
             logger.error(f"QB API error: {resp.status_code} - {resp.text}")
@@ -114,55 +127,133 @@ class QuickBooksClient:
         return resp.json()
     
     def find_vendor(self, vendor_name: str) -> Optional[dict]:
-        """Find vendor by name."""
-        # Escape single quotes in vendor name
+        """Find vendor by exact name, then fuzzy LIKE fallback."""
         safe_name = vendor_name.replace("'", "\\'")
-        query = f"SELECT * FROM Vendor WHERE DisplayName = '{safe_name}'"
         
+        # Exact match first
+        query = f"SELECT * FROM Vendor WHERE DisplayName = '{safe_name}'"
         try:
-            result = self._request("GET", f"query?query={query}")
+            result = self._request("GET", "query", params={"query": query})
             vendors = result.get("QueryResponse", {}).get("Vendor", [])
-            return vendors[0] if vendors else None
+            if vendors:
+                return vendors[0]
         except Exception as e:
-            logger.warning(f"Vendor lookup failed: {e}")
+            logger.warning(f"Vendor exact lookup failed: {e}")
+            return None
+        
+        # Fuzzy fallback - catch punctuation/case variants
+        query = f"SELECT * FROM Vendor WHERE DisplayName LIKE '%{safe_name}%'"
+        try:
+            result = self._request("GET", "query", params={"query": query})
+            vendors = result.get("QueryResponse", {}).get("Vendor", [])
+            
+            if not vendors:
+                return None
+            
+            # Normalize and compare
+            def normalize(name: str) -> str:
+                return "".join(c.lower() for c in (name or "") if c.isalnum())
+            
+            target = normalize(vendor_name)
+            for v in vendors:
+                if normalize(v.get("DisplayName", "")) == target:
+                    logger.info(f"Fuzzy vendor match: '{v.get('DisplayName')}' for '{vendor_name}'")
+                    return v
+            
+            # No normalized match among LIKE results
+            return None
+        except Exception as e:
+            logger.warning(f"Vendor fuzzy lookup failed: {e}")
             return None
     
     def create_vendor(self, vendor_name: str) -> dict:
-        """Create new vendor."""
+        """Create new vendor. Caller should have tried find_vendor first."""
+        logger.info(f"Creating new QB vendor: '{vendor_name}'")
         result = self._request("POST", "vendor", {"DisplayName": vendor_name})
         return result.get("Vendor", {})
     
     def find_account(self, account_name: str) -> Optional[dict]:
-        """Find account by name."""
+        """
+        Find account by name. Prefers exact FullyQualifiedName or Name match.
+        Raises if multiple LIKE matches but no exact match (ambiguous).
+        """
         search_name = account_name.split(":")[-1] if ":" in account_name else account_name
         safe_name = search_name.replace("'", "\\'")
         query = f"SELECT * FROM Account WHERE Name LIKE '%{safe_name}%'"
         
         try:
-            result = self._request("GET", f"query?query={query}")
+            result = self._request("GET", "query", params={"query": query})
             accounts = result.get("QueryResponse", {}).get("Account", [])
             
-            if accounts:
-                for acc in accounts:
-                    if acc.get("FullyQualifiedName") == account_name or acc.get("Name") == search_name:
-                        return acc
-                return accounts[0]
-            return None
+            if not accounts:
+                return None
+            
+            # Exact match on FullyQualifiedName (e.g. "PRODUCTION COSTS - ALWAYS USE:Freight In")
+            for acc in accounts:
+                if acc.get("FullyQualifiedName") == account_name:
+                    return acc
+            
+            # Exact match on Name (leaf name, e.g. "Freight In")
+            for acc in accounts:
+                if acc.get("Name") == search_name:
+                    return acc
+            
+            # No exact match - ambiguous
+            matched_names = [acc.get("FullyQualifiedName", acc.get("Name", "?")) for acc in accounts]
+            logger.error(
+                f"Ambiguous account match for '{account_name}': "
+                f"found {len(accounts)} results: {matched_names}"
+            )
+            raise Exception(
+                f"Ambiguous account: '{account_name}' matched {len(accounts)} accounts: {matched_names}. "
+                f"Fix the qb_category mapping or QB chart of accounts."
+            )
+        except requests.exceptions.HTTPError:
+            raise
         except Exception as e:
+            if "Ambiguous" in str(e):
+                raise
             logger.warning(f"Account lookup failed: {e}")
             return None
     
-    def bill_exists(self, doc_number: str) -> bool:
-        """Check if bill already exists."""
+    def bill_exists(self, doc_number: str, vendor_name: str) -> tuple:
+        """
+        Check if bill already exists for this vendor.
+        Returns (exists: bool, qb_bill_id: Optional[str]).
+        Queries by DocNumber, then compares VendorRef.name to avoid
+        false positives from DocNumber collisions across vendors.
+        """
         safe_num = doc_number.replace("'", "\\'")
-        query = f"SELECT Id FROM Bill WHERE DocNumber = '{safe_num}'"
+        query = f"SELECT Id, DocNumber, VendorRef FROM Bill WHERE DocNumber = '{safe_num}'"
+        
+        def normalize(name: str) -> str:
+            return "".join(c.lower() for c in (name or "") if c.isalnum())
         
         try:
-            result = self._request("GET", f"query?query={query}")
+            result = self._request("GET", "query", params={"query": query})
             bills = result.get("QueryResponse", {}).get("Bill", [])
-            return len(bills) > 0
-        except:
-            return False
+            
+            if not bills:
+                return False, None
+            
+            # Check for vendor match among bills with this DocNumber
+            for bill in bills:
+                qb_vendor = bill.get("VendorRef", {}).get("name", "")
+                if normalize(qb_vendor) == normalize(vendor_name):
+                    qb_id = bill.get("Id")
+                    logger.info(f"Duplicate found: QB Bill {qb_id} for {vendor_name} doc {doc_number}")
+                    return True, qb_id
+            
+            # DocNumber exists but different vendor - not a duplicate, log warning
+            qb_vendors = [b.get("VendorRef", {}).get("name", "") for b in bills]
+            logger.warning(
+                f"DocNumber {doc_number} exists in QB but vendor differs: "
+                f"QB={qb_vendors} vs posting='{vendor_name}' - proceeding with post"
+            )
+            return False, None
+        except Exception as e:
+            logger.error(f"Duplicate check failed for {doc_number}: {e}")
+            raise
     
     def create_bill(self, bill_data: dict) -> dict:
         """Create bill."""
@@ -232,7 +323,10 @@ def get_invoice(entry_id: str) -> Optional[dict]:
     try:
         resp = table.get_item(Key={"entry_id": entry_id})
         item = resp.get("Item")
-        return json.loads(json.dumps(item, default=str)) if item else None
+        if not item:
+            return None
+        # Decimal → float (not str) so numeric fields stay numeric after roundtrip
+        return json.loads(json.dumps(item, default=lambda o: float(o) if isinstance(o, Decimal) else str(o)))
     except ClientError as e:
         logger.error(f"DynamoDB get failed: {e}")
         return None
@@ -241,13 +335,17 @@ def get_invoice(entry_id: str) -> Optional[dict]:
 def claim_invoice(entry_id: str) -> bool:
     """
     Attempt to claim invoice for processing.
-    Uses conditional update: APPROVED → POSTING.
+    Uses conditional update: APPROVED → POSTING (or stale POSTING → POSTING).
     Only one worker can claim successfully.
     """
     if not table:
         return True
     
+    now = datetime.utcnow()
+    lease_cutoff = (now - timedelta(minutes=CLAIM_LEASE_MINUTES)).isoformat()
+    
     try:
+        # Try APPROVED → POSTING first
         table.update_item(
             Key={"entry_id": entry_id},
             UpdateExpression="SET #status = :posting, claim_time = :ts",
@@ -255,17 +353,37 @@ def claim_invoice(entry_id: str) -> bool:
             ExpressionAttributeValues={
                 ":posting": STATUS_POSTING,
                 ":approved": STATUS_APPROVED,
-                ":ts": datetime.utcnow().isoformat()
+                ":ts": now.isoformat()
             },
             ConditionExpression="#status = :approved"
         )
         logger.info(f"Claimed invoice {entry_id} for processing")
         return True
     except ClientError as e:
-        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
-            logger.warning(f"Invoice {entry_id} already claimed or not in APPROVED state")
+        if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
+            logger.error(f"Claim failed: {e}")
             return False
-        logger.error(f"Claim failed: {e}")
+    
+    # APPROVED claim failed - try re-claiming stale POSTING
+    try:
+        table.update_item(
+            Key={"entry_id": entry_id},
+            UpdateExpression="SET claim_time = :ts",
+            ExpressionAttributeValues={
+                ":posting": STATUS_POSTING,
+                ":ts": now.isoformat(),
+                ":cutoff": lease_cutoff,
+            },
+            ConditionExpression="#status = :posting AND claim_time < :cutoff",
+            ExpressionAttributeNames={"#status": "status"},
+        )
+        logger.warning(f"Re-claimed stale POSTING invoice {entry_id}")
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            logger.warning(f"Invoice {entry_id} already claimed or not in claimable state")
+        else:
+            logger.error(f"Re-claim failed: {e}")
         return False
 
 
@@ -335,6 +453,20 @@ def send_alert(subject: str, message: str):
             logger.error(f"Alert failed: {e}")
 
 
+def normalize_date(date_val) -> Optional[str]:
+    """Normalize date to YYYY-MM-DD for QB API. Handles date, datetime, ISO strings."""
+    if not date_val:
+        return None
+    date_str = str(date_val)[:10]  # Truncate any time/timezone portion
+    try:
+        # Validate it's actually a date
+        datetime.strptime(date_str, "%Y-%m-%d")
+        return date_str
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid date format: {date_val}")
+        return None
+
+
 def build_qb_bill(invoice: dict, qb: QuickBooksClient, account_cache: dict) -> dict:
     """Build QB bill payload."""
     
@@ -370,14 +502,35 @@ def build_qb_bill(invoice: dict, qb: QuickBooksClient, account_cache: dict) -> d
             "Description": (line.get("description") or "")[:4000],
         })
     
-    return {
+    # Reconcile line totals with bill total (avoid QB rejection from rounding drift)
+    if lines:
+        line_total = sum(l["Amount"] for l in lines)
+        bill_total = round(float(invoice.get("amount_untaxed", invoice.get("amount_total", 0))), 2)
+        diff = round(bill_total - line_total, 2)
+        
+        if 0 < abs(diff) <= 0.05:
+            # Adjust last line by the penny difference
+            lines[-1]["Amount"] = round(lines[-1]["Amount"] + diff, 2)
+            logger.info(f"Adjusted last line by ${diff:+.2f} to match bill total ${bill_total:.2f}")
+        elif abs(diff) > 0.05:
+            logger.warning(f"Line total ${line_total:.2f} differs from bill total ${bill_total:.2f} by ${diff:.2f}")
+    
+    bill = {
         "VendorRef": {"value": vendor_id},
         "Line": lines,
-        "DocNumber": (invoice.get("bill_reference") or invoice.get("entry_id", "").replace("/", "-"))[:21],
-        "TxnDate": invoice.get("bill_date"),
-        "DueDate": invoice.get("due_date"),
+        "DocNumber": compute_qb_doc_number(invoice.get("bill_reference", ""), invoice.get("entry_id", "")),
         "PrivateNote": (invoice.get("po_number") or "")[:4000],
     }
+    
+    txn_date = normalize_date(invoice.get("bill_date"))
+    if txn_date:
+        bill["TxnDate"] = txn_date
+    
+    due_date = normalize_date(invoice.get("due_date"))
+    if due_date:
+        bill["DueDate"] = due_date
+    
+    return bill
 
 
 def process_invoice(entry_id: str) -> bool:
@@ -398,11 +551,25 @@ def process_invoice(entry_id: str) -> bool:
         return True
     
     if current_status == STATUS_POSTING:
-        logger.info(f"Already being processed by another worker: {entry_id}")
-        return True
+        # Check if claim is stale (Lambda died mid-post)
+        claim_time = invoice.get("claim_time", "")
+        if claim_time:
+            try:
+                claimed_at = datetime.fromisoformat(claim_time)
+                elapsed = (datetime.utcnow() - claimed_at).total_seconds() / 60
+                if elapsed > CLAIM_LEASE_MINUTES:
+                    logger.warning(f"Stale POSTING claim on {entry_id} ({elapsed:.0f}min old), re-claiming")
+                    # Fall through to claim logic below
+                else:
+                    logger.info(f"Already being processed by another worker: {entry_id} ({elapsed:.0f}min ago)")
+                    return True
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid claim_time for {entry_id}, re-claiming")
+        else:
+            logger.warning(f"POSTING with no claim_time for {entry_id}, re-claiming")
     
-    if current_status != STATUS_APPROVED:
-        logger.warning(f"Invoice not approved: {entry_id} (status={current_status})")
+    if current_status not in (STATUS_APPROVED, STATUS_POSTING):
+        logger.warning(f"Invoice not in claimable state: {entry_id} (status={current_status})")
         return False
     
     # Try to claim the invoice (atomic APPROVED → POSTING)
@@ -414,7 +581,8 @@ def process_invoice(entry_id: str) -> bool:
     
     if DRY_RUN:
         logger.info(f"[DRY RUN] Would post {entry_id} to QB for {company}")
-        update_invoice_status(entry_id, STATUS_POSTED, qb_bill_id="DRY_RUN")
+        # Revert claim so invoice can be posted when DRY_RUN is turned off
+        update_invoice_status(entry_id, STATUS_APPROVED, error="DRY_RUN - not posted")
         return True
     
     try:
@@ -440,12 +608,17 @@ def process_invoice(entry_id: str) -> bool:
             realm_id=realm_id
         )
         
-        # Check for duplicate in QB
-        bill_ref = invoice.get("bill_reference", "")
-        if bill_ref and qb.bill_exists(bill_ref):
-            logger.warning(f"Bill already exists in QB: {bill_ref}")
-            update_invoice_status(entry_id, STATUS_POSTED, qb_bill_id="EXISTING")
-            return True
+        # Check for duplicate in QB (use same DocNumber as we'll post)
+        qb_doc_number = compute_qb_doc_number(
+            invoice.get("bill_reference", ""), invoice.get("entry_id", "")
+        )
+        vendor_name = invoice.get("vendor_name", "")
+        if qb_doc_number:
+            already_exists, existing_qb_id = qb.bill_exists(qb_doc_number, vendor_name)
+            if already_exists:
+                logger.warning(f"Bill already exists in QB: {qb_doc_number} (QB ID: {existing_qb_id})")
+                update_invoice_status(entry_id, STATUS_POSTED, qb_bill_id=existing_qb_id or "EXISTING")
+                return True
         
         # Build and create bill
         account_cache = {}
@@ -498,36 +671,46 @@ def process_invoice(entry_id: str) -> bool:
 
 
 def lambda_handler(event, context):
-    """Handle SQS events."""
+    """
+    Handle SQS events.
+    Uses partial batch failure reporting so one poison message
+    doesn't block the entire batch from completing.
+    """
     
-    logger.info(f"Processing {len(event.get('Records', []))} messages")
+    records = event.get("Records", [])
+    logger.info(f"Processing {len(records)} messages")
     
     success = 0
-    failed = 0
+    failed_message_ids = []
     
-    for record in event.get("Records", []):
+    for record in records:
+        message_id = record.get("messageId", "unknown")
         try:
             body = json.loads(record.get("body", "{}"))
             entry_id = body.get("entry_id")
             
             if not entry_id:
-                logger.warning("Message missing entry_id")
+                logger.warning(f"Message {message_id} missing entry_id - skipping")
                 continue
             
             if process_invoice(entry_id):
                 success += 1
             else:
-                failed += 1
+                failed_message_ids.append(message_id)
                 
         except Exception as e:
-            failed += 1
-            logger.error(f"Error processing message: {e}")
+            failed_message_ids.append(message_id)
+            logger.error(f"Error processing message {message_id}: {e}")
     
-    summary = f"Success: {success}, Failed: {failed}"
+    summary = f"Success: {success}, Failed: {len(failed_message_ids)}"
     logger.info(summary)
     
-    # If any failed, raise to retry via DLQ
-    if failed > 0:
-        raise Exception(f"Some invoices failed to post: {summary}")
+    # Return failed message IDs for individual retry (requires ReportBatchItemFailures on the event source)
+    if failed_message_ids:
+        return {
+            "batchItemFailures": [
+                {"itemIdentifier": mid} for mid in failed_message_ids
+            ]
+        }
     
-    return {"statusCode": 200, "body": json.dumps({"success": success, "failed": failed})}
+    return {"statusCode": 200, "body": json.dumps({"success": success, "failed": 0})}
