@@ -489,7 +489,7 @@ resource "aws_iam_role_policy" "approval_policy" {
         Resource = "arn:aws:logs:*:*:*"
       },
       {
-        Effect   = "Allow"
+        Effect +  = "Allow"
         Action   = ["dynamodb:GetItem", "dynamodb:UpdateItem"]
         Resource = aws_dynamodb_table.invoices.arn
       },
@@ -497,6 +497,11 @@ resource "aws_iam_role_policy" "approval_policy" {
         Effect   = "Allow"
         Action   = ["sqs:SendMessage"]
         Resource = aws_sqs_queue.approved_invoices.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:HeadObject"]
+        Resource = "${aws_s3_bucket.invoice_pdfs.arn}/*"
       },
       {
         Effect   = "Allow"
@@ -682,6 +687,7 @@ resource "aws_lambda_function" "approval_handler" {
         ODOO_SECRET_ARN          = aws_secretsmanager_secret.odoo_credentials.arn
         ODOO_API_URL             = var.odoo_api_url
         REJECTION_NOTIFY_USERS   = var.rejection_notify_users
+        S3_BUCKET        = aws_s3_bucket.invoice_pdfs.id
         SLACK_CHANNEL_ID         = var.slack_channel_id
       },
       local.dd_env_base,
@@ -734,6 +740,12 @@ resource "aws_apigatewayv2_route" "approval_post" {
   target    = "integrations/${aws_apigatewayv2_integration.approval_lambda.id}"
 }
 
+resource "aws_apigatewayv2_route" "pdf_get" {
+  api_id    = aws_apigatewayv2_api.approval.id
+  route_key = "GET /pdf"
+  target    = "integrations/${aws_apigatewayv2_integration.approval_lambda.id}"
+}
+
 resource "aws_lambda_permission" "api_gateway_invoke" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
@@ -767,6 +779,7 @@ resource "aws_lambda_function" "poster" {
         QB_SECRET_ARN   = aws_secretsmanager_secret.qb_credentials.arn
         DYNAMODB_TABLE  = aws_dynamodb_table.invoices.name
         S3_BUCKET       = aws_s3_bucket.invoice_pdfs.id
+        QB_USE_SANDBOX = var.qb_use_sandbox
         SNS_ALERT_TOPIC = aws_sns_topic.alerts.arn
       },
       local.dd_env_base,
@@ -871,8 +884,8 @@ output "sqs_queue_url" {
   value       = aws_sqs_queue.approved_invoices.url
 }
 
-output "secrets_to_configure" {
-  description = "Secrets that need to be configured manually"
+output "Secrets" {
+  description = "Secrets"
   value = {
     odoo  = aws_secretsmanager_secret.odoo_credentials.name
     qb    = aws_secretsmanager_secret.qb_credentials.name
