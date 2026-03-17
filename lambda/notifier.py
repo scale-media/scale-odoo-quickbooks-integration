@@ -11,6 +11,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote
 
 import boto3
 import requests
@@ -23,6 +24,7 @@ logger.setLevel(logging.INFO)
 SLACK_SECRET_ARN = os.environ.get("SLACK_SECRET_ARN", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "")
+APPROVAL_URL = os.environ.get("APPROVAL_URL", "")
 
 # AWS clients
 secrets_client = boto3.client("secretsmanager")
@@ -187,15 +189,14 @@ def build_slack_message(invoice: dict) -> dict:
     
     # Add PDF button if available
     if pdf_key:
-        pdf_url = get_presigned_url(pdf_key)
-        if pdf_url:
-            buttons.append({
-                "type": "button",
-                "text": {"type": "plain_text", "text": "📎 View PDF", "emoji": True},
-                "action_id": "view_pdf",
-                "url": pdf_url,
-                "value": entry_id
-            })
+        pdf_url = f"{APPROVAL_URL}pdf?entry_id={quote(entry_id)}"
+        buttons.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "📎 View PDF", "emoji": True},
+            "action_id": "view_pdf",
+            "url": pdf_url,
+            "value": entry_id
+        })
     
     blocks.append({
         "type": "actions",

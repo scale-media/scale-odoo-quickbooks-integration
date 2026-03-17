@@ -6,7 +6,7 @@ Updates DynamoDB status and enqueues approved invoices to SQS.
 
 On rejection:
   1. Stores rejected_by + rejection_reason in DynamoDB
-  2. Posts rejection notice in Slack tagging supply team contacts (Joe/Karina)
+  2. Posts rejection notice in Slack tagging supply team contacts (Joe/Dymo)
 """
 
 import os
@@ -31,8 +31,9 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "dev")
 DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "")
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
 SLACK_SECRET_ARN = os.environ.get("SLACK_SECRET_ARN", "")
+S3_BUCKET = os.environ.get("S3_BUCKET", "")
 
-# Slack user IDs to tag on rejections (Joe and Karina)
+# Slack user IDs to tag on rejections (Joe and Dymo)
 # Update these with actual Slack user IDs from your workspace
 REJECTION_NOTIFY_USERS = os.environ.get("REJECTION_NOTIFY_USERS", "").split(",")
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
@@ -58,6 +59,7 @@ REJECT_REASONS = [
 secrets_client = boto3.client("secretsmanager")
 dynamodb = boto3.resource("dynamodb")
 sqs_client = boto3.client("sqs")
+s3_client = boto3.client("s3")
 
 table = dynamodb.Table(DYNAMODB_TABLE) if DYNAMODB_TABLE else None
 
@@ -220,7 +222,7 @@ def enqueue_for_posting(entry_id: str) -> bool:
 def notify_slack_rejection(entry_id: str, reason: str, rejected_by: str,
                            vendor_name: str, amount: str, bot_token: str):
     """
-    Post a rejection notification in the Slack channel tagging Joe/Karina.
+    Post a rejection notification in the Slack channel tagging Joe/Dymo.
     """
     if not bot_token or not SLACK_CHANNEL_ID:
         logger.warning("Slack bot_token or channel_id not configured for rejection notification")
@@ -268,7 +270,7 @@ def notify_slack_rejection(entry_id: str, reason: str, rejected_by: str,
 def handle_rejection_notification(entry_id: str, reason: str, rejected_by: str, bot_token: str):
     """
     After a rejection is recorded in DynamoDB, notify the supply team via Slack.
-    Tags the configured users (Joe/Karina) so they know to review the bill in Odoo.
+    Tags the configured users (Joe/Dymo) so they know to review the bill in Odoo.
     """
     # Fetch invoice record for display fields
     invoice = get_invoice(entry_id)
@@ -541,10 +543,59 @@ def handle_modal_submit(payload: dict, bot_token: str) -> dict:
             update_slack_message(response_url, entry_id, "already_processed", user_id)
         return {"statusCode": 200, "body": "Already processed"}
 
+def handle_pdf_redirect(event):
+    """Generate fresh presigned S3 URL and redirect. Called via GET /pdf?entry_id=..."""
+    params = event.get("queryStringParameters") or {}
+    entry_id = params.get("entry_id", "")
+
+    if not entry_id:
+        return {"statusCode": 400, "body": "Missing entry_id"}
+
+    if not S3_BUCKET:
+        return {"statusCode": 500, "body": "S3 bucket not configured"}
+
+    try:
+        resp = table.get_item(Key={"entry_id": entry_id})
+        item = resp.get("Item")
+        if not item:
+            return {"statusCode": 404, "body": "Invoice not found"}
+
+        s3_key = item.get("pdf_s3_key", "")
+        if not s3_key:
+            return {"statusCode": 404, "body": "No PDF for this invoice"}
+
+        # Try posted path first, fall back to pending
+        posted_key = s3_key.replace("pending/", "posted/")
+        try:
+            s3_client.head_object(Bucket=S3_BUCKET, Key=posted_key)
+            use_key = posted_key
+        except Exception:
+            use_key = s3_key
+
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": use_key},
+            ExpiresIn=3600,
+        )
+
+        return {
+            "statusCode": 302,
+            "headers": {"Location": url},
+        }
+    except Exception as e:
+        logger.error(f"PDF redirect failed: {e}")
+        return {"statusCode": 500, "body": "Failed to generate PDF link"}
+
+
 def lambda_handler(event, context):
     """Handle API Gateway / Lambda Function URL requests from Slack."""
 
-    logger.info(f"Received request: {event.get('requestContext', {}).get('http', {}).get('method')}")
+    http_method = event.get("requestContext", {}).get("http", {}).get("method", "")
+    logger.info(f"Received request: {http_method}")
+
+    # PDF redirect (GET /pdf?entry_id=...)
+    if http_method == "GET":
+        return handle_pdf_redirect(event)
 
     # Get Slack config for verification
     config = get_slack_config()
